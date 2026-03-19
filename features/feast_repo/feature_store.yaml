@@ -1,0 +1,9 @@
+project: sentinel
+provider: local
+registry: data/registry.db
+online_store:
+    type: redis
+    connection_string: "redis://localhost:6379"
+offline_store:
+    type: file
+entity_key_serialization_version: 2

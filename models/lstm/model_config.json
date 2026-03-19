@@ -1,0 +1,18 @@
+{
+  "hidden_size": 64,
+  "n_layers": 2,
+  "dropout": 0.3,
+  "n_features": 9,
+  "seq_length": 30,
+  "features": [
+    "salary_delay_days",
+    "balance_wow_drop_pct",
+    "upi_lending_spike_ratio",
+    "utility_payment_latency",
+    "discretionary_contraction",
+    "atm_withdrawal_spike",
+    "failed_auto_debit_count",
+    "credit_utilization_delta",
+    "drift_score"
+  ]
+}

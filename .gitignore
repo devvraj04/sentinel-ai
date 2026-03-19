@@ -1,5 +1,6 @@
 .env
 .venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -15,4 +16,4 @@ mlartifacts/
 node_modules/
 dashboards/dist/
 *.log
-.DS_Store
+.DS_Store   

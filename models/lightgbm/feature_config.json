@@ -1,0 +1,17 @@
+{
+  "features": [
+    "salary_delay_days",
+    "balance_wow_drop_pct",
+    "upi_lending_spike_ratio",
+    "utility_payment_latency",
+    "discretionary_contraction",
+    "atm_withdrawal_spike",
+    "failed_auto_debit_count",
+    "credit_utilization_delta",
+    "drift_score",
+    "months_of_history",
+    "total_failed_debits_ever"
+  ],
+  "threshold": 0.4,
+  "pos_weight": 35.23170731707317
+}
