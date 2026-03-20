@@ -1,9 +1,21 @@
 """
 serving/bentoml_service/pulse_scorer.py
-Real-time Pulse Scorer with full SHAP contributions and DynamoDB write.
+──────────────────────────────────────────────────────────────────────────────
+Real-time Pulse Scorer.
+
+Two modes — selected automatically based on environment:
+  LOCAL MODE:     SAGEMAKER_ENDPOINT_NAME not set → uses local lgbm_model.joblib
+  SAGEMAKER MODE: SAGEMAKER_ENDPOINT_NAME is set  → calls AWS SageMaker endpoint
+
+Both modes:
+  - Read behavioral features from Redis
+  - Write Pulse Score to AWS DynamoDB
+  - Return full SHAP factor contributions
+──────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 from datetime import datetime, timezone
@@ -69,8 +81,10 @@ FEATURE_LABELS = {
 }
 
 
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
 def _get_dynamodb_resource():
-    """Always connects to real AWS DynamoDB."""
+    """Always connects to real AWS DynamoDB — never localhost."""
     return boto3.resource(
         "dynamodb",
         region_name=settings.aws_region,
@@ -81,10 +95,124 @@ def _get_dynamodb_resource():
     )
 
 
+def _pd_to_pulse_score(pd_probability: float) -> int:
+    """
+    Sigmoid scaling: PD → Pulse Score 0-100.
+    PD < 0.10 → score < 25  (green)
+    PD ~ 0.30 → score ~ 50  (orange boundary)
+    PD > 0.60 → score > 70  (red)
+    """
+    scaled = 1.0 / (1.0 + np.exp(-10.0 * (pd_probability - 0.30)))
+    return max(1, min(100, int(round(scaled * 100))))
+
+
+def _get_risk_tier(pulse_score: int) -> str:
+    if pulse_score >= 70: return "red"
+    if pulse_score >= 45: return "orange"
+    if pulse_score >= 25: return "yellow"
+    return "green"
+
+
+def _get_intervention(risk_tier: str) -> tuple[bool, Optional[str]]:
+    if risk_tier == "red":    return True, "payment_holiday_or_restructuring"
+    if risk_tier == "orange": return True, "flexible_emi_offer"
+    if risk_tier == "yellow": return True, "preventive_digital_nudge"
+    return False, None
+
+
+def _connect_redis_safe() -> Optional[redis.Redis]:
+    try:
+        r = redis.from_url(settings.redis_url, socket_connect_timeout=3)
+        r.ping()
+        logger.info("Redis connected", url=settings.redis_url)
+        return r
+    except Exception as e:
+        logger.warning("Redis unavailable", error=str(e))
+        return None
+
+
+def _connect_dynamo_safe() -> Optional[object]:
+    result = {"dynamo": None}
+
+    def _try():
+        try:
+            db = _get_dynamodb_resource()
+            db.meta.client.list_tables(Limit=1)
+            result["dynamo"] = db
+            logger.info("DynamoDB connected", region=settings.aws_region)
+        except Exception as e:
+            logger.warning("DynamoDB unavailable", error=str(e))
+
+    t = threading.Thread(target=_try, daemon=True)
+    t.start()
+    t.join(timeout=8)
+    if t.is_alive():
+        logger.warning("DynamoDB connection timed out")
+    return result["dynamo"]
+
+
+def _get_features_from_redis(
+    r: Optional[redis.Redis], customer_id: str
+) -> Optional[dict]:
+    if not r:
+        return None
+    try:
+        key  = f"sentinel:features:{customer_id}"
+        data = r.hgetall(key)
+        if not data:
+            return None
+        return {k.decode(): float(v) for k, v in data.items()}
+    except Exception as e:
+        logger.error("Redis retrieval failed", customer_id=customer_id, error=str(e))
+        return None
+
+
+def _write_score_to_dynamodb(dynamo, result: dict) -> None:
+    """Persist Pulse Score to AWS DynamoDB sentinel-customer-scores table."""
+    if dynamo is None:
+        return
+    try:
+        table      = dynamo.Table(settings.dynamodb_table_scores)
+        top_factor = (result["top_factors"][0]["feature_name"]
+                      if result.get("top_factors") else "unknown")
+        table.update_item(
+            Key={"customer_id": result["customer_id"]},
+            UpdateExpression="""
+                SET pulse_score       = :ps,
+                    risk_tier         = :rt,
+                    pd_probability    = :pd,
+                    confidence        = :cf,
+                    top_factor        = :tf,
+                    intervention_flag = :iv,
+                    intervention_type = :it,
+                    model_version     = :mv,
+                    updated_at        = :ua
+            """,
+            ExpressionAttributeValues={
+                ":ps": result["pulse_score"],
+                ":rt": result["risk_tier"],
+                ":pd": Decimal(str(round(result["pd_probability"], 6))),
+                ":cf": Decimal(str(round(result["confidence"], 4))),
+                ":tf": top_factor,
+                ":iv": result["intervention_recommended"],
+                ":it": result.get("intervention_type") or "none",
+                ":mv": result.get("model_version", "unknown"),
+                ":ua": result["scored_at"],
+            },
+        )
+    except Exception as e:
+        logger.error("DynamoDB write failed",
+                     customer_id=result["customer_id"], error=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCAL SCORER — uses lgbm_model.joblib + shap_explainer.joblib on disk
+# ══════════════════════════════════════════════════════════════════════════════
 class PulseScorer:
     """
-    Loads LightGBM + SHAP, reads features from Redis,
-    writes scored results to AWS DynamoDB.
+    Local model scorer.
+    Loads LightGBM + SHAP from disk.
+    Used when SAGEMAKER_ENDPOINT_NAME is NOT set.
     """
 
     def __init__(self):
@@ -95,110 +223,33 @@ class PulseScorer:
         self._load()
 
     def _load(self):
-        # Load model
+        # Model
         if os.path.exists(MODEL_PATH):
             self._model_package = joblib.load(MODEL_PATH)
-            logger.info("LightGBM model loaded",
+            logger.info("LightGBM model loaded (local)",
                         version=self._model_package.get("version"),
                         cv_auc=self._model_package.get("cv_auc"))
         else:
             logger.warning("Model not found — rule-based fallback", path=MODEL_PATH)
 
-        # Load SHAP
+        # SHAP
         if os.path.exists(SHAP_PATH):
             self._explainer = joblib.load(SHAP_PATH)
             logger.info("SHAP explainer loaded")
 
-        # Connect Redis
-        try:
-            self._redis = redis.from_url(
-                settings.redis_url, socket_connect_timeout=3
-            )
-            self._redis.ping()
-            logger.info("Redis connected", url=settings.redis_url)
-        except Exception as e:
-            logger.warning("Redis unavailable", error=str(e))
-            self._redis = None
+        # Redis
+        self._redis = _connect_redis_safe()
 
-        # Connect DynamoDB with timeout (non-blocking)
-        def _connect_dynamo():
-            try:
-                self._dynamo = _get_dynamodb_resource()
-                self._dynamo.meta.client.list_tables(Limit=1)
-                logger.info("DynamoDB connected", region=settings.aws_region)
-            except Exception as e:
-                logger.warning("DynamoDB unavailable", error=str(e))
-                self._dynamo = None
+        # DynamoDB
+        self._dynamo = _connect_dynamo_safe()
 
-        t = threading.Thread(target=_connect_dynamo, daemon=True)
-        t.start()
-        t.join(timeout=8)
-        if t.is_alive():
-            logger.warning("DynamoDB connection timed out")
-            self._dynamo = None
-
-    def _get_features_from_redis(self, customer_id: str) -> Optional[dict]:
-        """Retrieve pre-computed behavioral features from Redis."""
-        if not self._redis:
-            return None
-        try:
-            key  = f"sentinel:features:{customer_id}"
-            data = self._redis.hgetall(key)
-            if not data:
-                return None
-            return {k.decode(): float(v) for k, v in data.items()}
-        except Exception as e:
-            logger.error("Redis retrieval failed",
-                         customer_id=customer_id, error=str(e))
-            return None
-
-    def _build_feature_vector(self, features: dict,
-                               feature_cols: list) -> np.ndarray:
-        """Build numpy array from feature dict, filling missing with 0."""
-        return np.array(
-            [features.get(col, 0.0) for col in feature_cols], dtype=float
-        )
-
-    def _pd_to_pulse_score(self, pd_probability: float) -> int:
-        """
-        Sigmoid scaling: PD → Pulse Score 0-100
-        PD < 0.10 → score < 25  (green)
-        PD ~ 0.30 → score ~ 50  (orange boundary)
-        PD > 0.60 → score > 70  (red)
-        """
-        scaled = 1.0 / (1.0 + np.exp(-10.0 * (pd_probability - 0.30)))
-        return max(1, min(100, int(round(scaled * 100))))
-
-    def _get_risk_tier(self, pulse_score: int) -> str:
-        """Map pulse score to risk tier."""
-        if pulse_score >= 70:
-            return "red"
-        if pulse_score >= 45:
-            return "orange"
-        if pulse_score >= 25:
-            return "yellow"
-        return "green"
-
-    def _get_intervention(self, risk_tier: str) -> tuple[bool, Optional[str]]:
-        """Return intervention recommendation based on risk tier."""
-        if risk_tier == "red":
-            return True, "payment_holiday_or_restructuring"
-        if risk_tier == "orange":
-            return True, "flexible_emi_offer"
-        if risk_tier == "yellow":
-            return True, "preventive_digital_nudge"
-        return False, None
-
-    def _compute_shap(self, fv: np.ndarray,
-                      feature_cols: list) -> list[dict]:
-        """Compute SHAP values and return top 5 contributing factors."""
+    def _compute_shap(self, fv: np.ndarray, feature_cols: list) -> list[dict]:
         if self._explainer is None:
             return []
         try:
             shap_values = self._explainer.shap_values(fv.reshape(1, -1))
             vals = shap_values[1][0] if isinstance(shap_values, list) \
                    else shap_values[0]
-
             factors = []
             for i, col in enumerate(feature_cols):
                 contrib = float(vals[i])
@@ -218,51 +269,11 @@ class PulseScorer:
             logger.error("SHAP failed", error=str(e))
             return []
 
-    def _write_to_dynamodb(self, result: dict) -> None:
-        """Persist Pulse Score to AWS DynamoDB sentinel-customer-scores."""
-        if self._dynamo is None:
-            return
-        try:
-            table      = self._dynamo.Table(settings.dynamodb_table_scores)
-            top_factor = (result["top_factors"][0]["feature_name"]
-                          if result.get("top_factors") else "unknown")
-            table.update_item(
-                Key={"customer_id": result["customer_id"]},
-                UpdateExpression="""
-                    SET pulse_score       = :ps,
-                        risk_tier         = :rt,
-                        pd_probability    = :pd,
-                        confidence        = :cf,
-                        top_factor        = :tf,
-                        intervention_flag = :iv,
-                        intervention_type = :it,
-                        model_version     = :mv,
-                        updated_at        = :ua
-                """,
-                ExpressionAttributeValues={
-                    ":ps": result["pulse_score"],
-                    ":rt": result["risk_tier"],
-                    ":pd": Decimal(str(round(result["pd_probability"], 6))),
-                    ":cf": Decimal(str(round(result["confidence"], 4))),
-                    ":tf": top_factor,
-                    ":iv": result["intervention_recommended"],
-                    ":it": result.get("intervention_type") or "none",
-                    ":mv": result.get("model_version", "unknown"),
-                    ":ua": result["scored_at"],
-                },
-            )
-        except Exception as e:
-            logger.error("DynamoDB write failed",
-                         customer_id=result["customer_id"], error=str(e))
-
     def _fallback_score(self, customer_id: str) -> dict:
-        """Rule-based fallback when model or Redis features unavailable."""
-        idx = int(customer_id.replace("CUST", "")) \
-              if customer_id.startswith("CUST") else 500
-        pd_prob = round(np.random.uniform(0.02, 0.18), 4)
-        pulse_score = self._pd_to_pulse_score(pd_prob)
-        risk_tier   = self._get_risk_tier(pulse_score)
-        recommended, intervention_type = self._get_intervention(risk_tier)
+        pd_prob     = round(np.random.uniform(0.02, 0.18), 4)
+        pulse_score = _pd_to_pulse_score(pd_prob)
+        risk_tier   = _get_risk_tier(pulse_score)
+        recommended, intervention_type = _get_intervention(risk_tier)
         return {
             "customer_id":              customer_id,
             "pulse_score":              pulse_score,
@@ -279,13 +290,12 @@ class PulseScorer:
         }
 
     def score(self, customer_id: str, force_refresh: bool = False) -> dict:
-        """Score a customer. Writes result to DynamoDB."""
-        features = self._get_features_from_redis(customer_id)
+        features = _get_features_from_redis(self._redis, customer_id)
 
         if not features or self._model_package is None:
             logger.warning("Using fallback scorer", customer_id=customer_id)
             result = self._fallback_score(customer_id)
-            self._write_to_dynamodb(result)
+            _write_score_to_dynamodb(self._dynamo, result)
             return result
 
         model        = self._model_package["model"]
@@ -293,16 +303,16 @@ class PulseScorer:
         version      = self._model_package.get("version", "unknown")
 
         features["month_offset"] = 0.0
-        fv = self._build_feature_vector(features, feature_cols)
+        fv = np.array([features.get(col, 0.0) for col in feature_cols], dtype=float)
 
         pd_prob     = float(model.predict_proba(fv.reshape(1, -1))[0, 1])
-        pulse_score = self._pd_to_pulse_score(pd_prob)
-        risk_tier   = self._get_risk_tier(pulse_score)
-        recommended, intervention_type = self._get_intervention(risk_tier)
+        pulse_score = _pd_to_pulse_score(pd_prob)
+        risk_tier   = _get_risk_tier(pulse_score)
+        recommended, intervention_type = _get_intervention(risk_tier)
         confidence  = float(abs(pd_prob - 0.5) * 2)
         top_factors = self._compute_shap(fv, feature_cols)
 
-        logger.info("Customer scored",
+        logger.info("Customer scored (local)",
                     customer_id=customer_id,
                     pulse_score=pulse_score,
                     risk_tier=risk_tier,
@@ -323,17 +333,136 @@ class PulseScorer:
             "cached":                   False,
         }
 
-        self._write_to_dynamodb(result)
+        _write_score_to_dynamodb(self._dynamo, result)
         return result
 
 
-# Singleton
-_scorer: Optional[PulseScorer] = None
+# ══════════════════════════════════════════════════════════════════════════════
+# SAGEMAKER SCORER — calls AWS SageMaker endpoint
+# Used when SAGEMAKER_ENDPOINT_NAME is set in .env
+# ══════════════════════════════════════════════════════════════════════════════
+class SageMakerScorer:
+    """
+    Calls the deployed SageMaker endpoint for inference.
+    Drop-in replacement for PulseScorer.
+    The model runs on AWS — not on your laptop.
+    """
+
+    def __init__(self, endpoint_name: str):
+        self._endpoint = endpoint_name
+        self._redis    = None
+        self._dynamo   = None
+
+        # SageMaker runtime client
+        self._sm_client = boto3.client(
+            "sagemaker-runtime",
+            region_name=settings.aws_region,
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            config=Config(connect_timeout=10, read_timeout=30,
+                          retries={"max_attempts": 2}),
+        )
+
+        self._redis  = _connect_redis_safe()
+        self._dynamo = _connect_dynamo_safe()
+
+        logger.info("SageMaker scorer ready",
+                    endpoint=endpoint_name,
+                    region=settings.aws_region)
+
+    def _fallback_score(self, customer_id: str) -> dict:
+        pd_prob     = round(np.random.uniform(0.02, 0.18), 4)
+        pulse_score = _pd_to_pulse_score(pd_prob)
+        risk_tier   = _get_risk_tier(pulse_score)
+        recommended, intervention_type = _get_intervention(risk_tier)
+        return {
+            "customer_id":              customer_id,
+            "pulse_score":              pulse_score,
+            "risk_tier":                risk_tier,
+            "pd_probability":           pd_prob,
+            "confidence":               0.5,
+            "top_factors":              [],
+            "intervention_recommended": recommended,
+            "intervention_type":        intervention_type,
+            "scored_at":                datetime.now(timezone.utc).isoformat(),
+            "model_version":            "sagemaker-fallback",
+            "cached":                   False,
+            "warning":                  "SageMaker endpoint unavailable",
+        }
+
+    def score(self, customer_id: str, force_refresh: bool = False) -> dict:
+        # Get features from Redis
+        features = _get_features_from_redis(self._redis, customer_id) or {}
+        features["month_offset"] = 0.0
+
+        try:
+            # Call SageMaker endpoint
+            payload  = json.dumps({"customer_id": customer_id, "features": features})
+            response = self._sm_client.invoke_endpoint(
+                EndpointName=self._endpoint,
+                ContentType="application/json",
+                Body=payload.encode("utf-8"),
+            )
+            result = json.loads(response["Body"].read().decode("utf-8"))
+
+            # Enrich result with human-readable labels if not already present
+            for factor in result.get("top_factors", []):
+                if "human_readable" not in factor:
+                    factor["human_readable"] = FEATURE_LABELS.get(
+                        factor.get("feature_name", ""), factor.get("feature_name", "")
+                    )
+
+            result["cached"] = False
+            result["scored_at"] = datetime.now(timezone.utc).isoformat()
+
+            # Add intervention recommendation if not returned by endpoint
+            if "intervention_recommended" not in result:
+                tier = result.get("risk_tier", "green")
+                recommended, intervention_type = _get_intervention(tier)
+                result["intervention_recommended"] = recommended
+                result["intervention_type"]        = intervention_type
+
+            logger.info("Customer scored (SageMaker)",
+                        customer_id=customer_id,
+                        pulse_score=result.get("pulse_score"),
+                        risk_tier=result.get("risk_tier"),
+                        endpoint=self._endpoint)
+
+        except Exception as e:
+            logger.error("SageMaker endpoint call failed",
+                         customer_id=customer_id,
+                         endpoint=self._endpoint,
+                         error=str(e))
+            result = self._fallback_score(customer_id)
+
+        _write_score_to_dynamodb(self._dynamo, result)
+        return result
 
 
-def get_scorer() -> PulseScorer:
-    """Return singleton PulseScorer instance."""
+# ══════════════════════════════════════════════════════════════════════════════
+# SINGLETON — auto-selects local vs SageMaker based on .env
+# ══════════════════════════════════════════════════════════════════════════════
+_scorer: Optional[PulseScorer | SageMakerScorer] = None
+
+
+def get_scorer() -> PulseScorer | SageMakerScorer:
+    """
+    Returns singleton scorer instance.
+
+    Selection logic:
+      If SAGEMAKER_ENDPOINT_NAME is set in .env → SageMakerScorer
+      Otherwise                                 → PulseScorer (local)
+
+    To switch to SageMaker after deploying the endpoint, just add to .env:
+      SAGEMAKER_ENDPOINT_NAME=sentinel-pulse-scorer
+    """
     global _scorer
     if _scorer is None:
-        _scorer = PulseScorer()
+        endpoint_name = os.environ.get("SAGEMAKER_ENDPOINT_NAME", "").strip()
+        if endpoint_name:
+            logger.info("Using SageMaker scorer", endpoint=endpoint_name)
+            _scorer = SageMakerScorer(endpoint_name)
+        else:
+            logger.info("Using local scorer", model_path=MODEL_PATH)
+            _scorer = PulseScorer()
     return _scorer

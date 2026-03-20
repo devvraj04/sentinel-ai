@@ -1,0 +1,6 @@
+numpy==1.23.5
+numba==0.57.1
+llvmlite==0.40.1
+shap==0.41.0
+lightgbm==4.3.0
+pyarrow==15.0.2

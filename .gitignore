@@ -1,6 +1,8 @@
 .env
 .venv/
 venv/
+venv_aws
+venv_sage
 __pycache__/
 *.pyc
 *.pyo
