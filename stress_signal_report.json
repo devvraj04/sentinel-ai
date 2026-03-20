@@ -1,0 +1,1390 @@
+{
+  "generated_at": "2026-03-20T16:45:52.620962+00:00",
+  "runtime_minutes": 0,
+  "total_transactions_seen": 1000,
+  "total_stress_signals": 101,
+  "affected_customers": 77,
+  "signal_breakdown": {
+    "large_atm_withdrawal": 42,
+    "lending_app_upi": 47,
+    "large_savings_drain": 12
+  },
+  "customers": [
+    {
+      "rank": 1,
+      "customer_id": "CUST00108",
+      "stress_signal_count": 5,
+      "high_severity": 0,
+      "medium_severity": 5,
+      "total_amount": 42598.39,
+      "signals": [
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 11791.05,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 10807.34,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "customer_id": "CUST00010",
+      "stress_signal_count": 4,
+      "high_severity": 3,
+      "medium_severity": 1,
+      "total_amount": 52531.89,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 17343.51,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 16303.67,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 8884.71,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "customer_id": "CUST00009",
+      "stress_signal_count": 4,
+      "high_severity": 1,
+      "medium_severity": 3,
+      "total_amount": 31750.96,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 1750.96,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 4,
+      "customer_id": "CUST00049",
+      "stress_signal_count": 3,
+      "high_severity": 1,
+      "medium_severity": 2,
+      "total_amount": 24603.59,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 4603.59,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 5,
+      "customer_id": "CUST00093",
+      "stress_signal_count": 3,
+      "high_severity": 1,
+      "medium_severity": 2,
+      "total_amount": 50088.01,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 22522.05,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 16179.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 11386.96,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 6,
+      "customer_id": "CUST00125",
+      "stress_signal_count": 3,
+      "high_severity": 1,
+      "medium_severity": 2,
+      "total_amount": 17101.11,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 2101.11,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 7,
+      "customer_id": "CUST00897",
+      "stress_signal_count": 2,
+      "high_severity": 1,
+      "medium_severity": 1,
+      "total_amount": 13950.37,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 1668.65,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        },
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 12281.72,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 8,
+      "customer_id": "CUST00653",
+      "stress_signal_count": 2,
+      "high_severity": 2,
+      "medium_severity": 0,
+      "total_amount": 16693.13,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 9039.09,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 7654.04,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 9,
+      "customer_id": "CUST00018",
+      "stress_signal_count": 2,
+      "high_severity": 2,
+      "medium_severity": 0,
+      "total_amount": 24658.17,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 2680.53,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 21977.64,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 10,
+      "customer_id": "CUST00029",
+      "stress_signal_count": 2,
+      "high_severity": 1,
+      "medium_severity": 1,
+      "total_amount": 66545.91,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 14851.52,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 51694.39,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 11,
+      "customer_id": "CUST00028",
+      "stress_signal_count": 2,
+      "high_severity": 1,
+      "medium_severity": 1,
+      "total_amount": 15795.47,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 5795.47,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 12,
+      "customer_id": "CUST00081",
+      "stress_signal_count": 2,
+      "high_severity": 1,
+      "medium_severity": 1,
+      "total_amount": 15021.84,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 10021.84,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 13,
+      "customer_id": "CUST00097",
+      "stress_signal_count": 2,
+      "high_severity": 2,
+      "medium_severity": 0,
+      "total_amount": 11395.05,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 4602.31,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 6792.74,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 14,
+      "customer_id": "CUST00118",
+      "stress_signal_count": 2,
+      "high_severity": 1,
+      "medium_severity": 1,
+      "total_amount": 17323.75,
+      "signals": [
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 13106.27,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        },
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 4217.48,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 15,
+      "customer_id": "CUST00260",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 16:45:04.367804+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 16,
+      "customer_id": "CUST00172",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 9680.1,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 9680.1,
+          "timestamp": "2026-03-20 16:45:18.113234+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 17,
+      "customer_id": "CUST00972",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 12278.01,
+      "signals": [
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 12278.01,
+          "timestamp": "2026-03-20 17:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 18,
+      "customer_id": "CUST01122",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 17:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 19,
+      "customer_id": "CUST00881",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10677.21,
+      "signals": [
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 10677.21,
+          "timestamp": "2026-03-20 17:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 20,
+      "customer_id": "CUST00135",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 7888.2,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 7888.2,
+          "timestamp": "2026-03-20 17:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 21,
+      "customer_id": "CUST01118",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 13328.5,
+      "signals": [
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 13328.5,
+          "timestamp": "2026-03-20 17:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 22,
+      "customer_id": "CUST00935",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 12105.68,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 12105.68,
+          "timestamp": "2026-03-20 17:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 23,
+      "customer_id": "CUST00092",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 12433.22,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 12433.22,
+          "timestamp": "2026-03-20 17:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 24,
+      "customer_id": "CUST01216",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 4322.42,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 4322.42,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 25,
+      "customer_id": "CUST00100",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 2386.65,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 2386.65,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 26,
+      "customer_id": "CUST00777",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 12829.66,
+      "signals": [
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 12829.66,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 27,
+      "customer_id": "CUST00778",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 25116.43,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 25116.43,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 28,
+      "customer_id": "CUST00760",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 14411.87,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 14411.87,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 29,
+      "customer_id": "CUST00442",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 1441.99,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 1441.99,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 30,
+      "customer_id": "CUST00991",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 4174.13,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 4174.13,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 31,
+      "customer_id": "CUST01495",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10072.78,
+      "signals": [
+        {
+          "signal": "\u26a1 Large Savings Withdrawal",
+          "severity": "MEDIUM",
+          "amount": 10072.78,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 32,
+      "customer_id": "CUST01459",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 9406.07,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 9406.07,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 33,
+      "customer_id": "CUST01264",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 18:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 34,
+      "customer_id": "CUST00529",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 19:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 35,
+      "customer_id": "CUST00912",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 19:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 36,
+      "customer_id": "CUST00310",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 5053.61,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 5053.61,
+          "timestamp": "2026-03-20 19:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 37,
+      "customer_id": "CUST01162",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 17626.32,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 17626.32,
+          "timestamp": "2026-03-20 19:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 38,
+      "customer_id": "CUST00372",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 19:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 39,
+      "customer_id": "CUST01246",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 19:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 40,
+      "customer_id": "CUST00599",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 6492.87,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 6492.87,
+          "timestamp": "2026-03-20 19:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 41,
+      "customer_id": "CUST00938",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 8074.92,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 8074.92,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 42,
+      "customer_id": "CUST00359",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 43,
+      "customer_id": "CUST00627",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 22593.61,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 22593.61,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 44,
+      "customer_id": "CUST01203",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 7235.45,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 7235.45,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 45,
+      "customer_id": "CUST00902",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 46,
+      "customer_id": "CUST00254",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 47,
+      "customer_id": "CUST00638",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 48,
+      "customer_id": "CUST01253",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 7764.57,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 7764.57,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 49,
+      "customer_id": "CUST01157",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 20:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 50,
+      "customer_id": "CUST01257",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 51,
+      "customer_id": "CUST01079",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 52,
+      "customer_id": "CUST00462",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 53,
+      "customer_id": "CUST01471",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 12728.04,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 12728.04,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 54,
+      "customer_id": "CUST01013",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 1598.95,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 1598.95,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 55,
+      "customer_id": "CUST01391",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 56,
+      "customer_id": "CUST00951",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 57,
+      "customer_id": "CUST00047",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 1269.0,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 1269.0,
+          "timestamp": "2026-03-20 21:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 58,
+      "customer_id": "CUST00490",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 13704.78,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 13704.78,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 59,
+      "customer_id": "CUST01183",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 60,
+      "customer_id": "CUST00210",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 19708.88,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 19708.88,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 61,
+      "customer_id": "CUST00455",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 62,
+      "customer_id": "CUST01304",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 63,
+      "customer_id": "CUST00842",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 5174.49,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 5174.49,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 64,
+      "customer_id": "CUST01244",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 65,
+      "customer_id": "CUST00793",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 14396.37,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 14396.37,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 66,
+      "customer_id": "CUST00175",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 67,
+      "customer_id": "CUST00603",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 68,
+      "customer_id": "CUST00824",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 22:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 69,
+      "customer_id": "CUST00017",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 70,
+      "customer_id": "CUST00016",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 71,
+      "customer_id": "CUST00008",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 8158.89,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 8158.89,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 72,
+      "customer_id": "CUST00073",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 73,
+      "customer_id": "CUST00096",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 10000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 10000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 74,
+      "customer_id": "CUST00105",
+      "stress_signal_count": 1,
+      "high_severity": 0,
+      "medium_severity": 1,
+      "total_amount": 5000.0,
+      "signals": [
+        {
+          "signal": "\u26a1 Large ATM Withdrawal (cash hoarding)",
+          "severity": "MEDIUM",
+          "amount": 5000.0,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 75,
+      "customer_id": "CUST00106",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 8248.18,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 8248.18,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 76,
+      "customer_id": "CUST00107",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 10184.01,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 10184.01,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    },
+    {
+      "rank": 77,
+      "customer_id": "CUST00120",
+      "stress_signal_count": 1,
+      "high_severity": 1,
+      "medium_severity": 0,
+      "total_amount": 14886.14,
+      "signals": [
+        {
+          "signal": "\u26a0  Borrowed from Lending App",
+          "severity": "HIGH",
+          "amount": 14886.14,
+          "timestamp": "2026-03-20 23:59:59+00:00"
+        }
+      ]
+    }
+  ]
+}

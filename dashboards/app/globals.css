@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: #ffffff;
+  --color-foreground: #171717;
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: ui-monospace, Consolas, monospace;
+
+  /* Navy brand */
+  --color-navy: #1B2A4A;
+  --color-navy-50: #EBF0FA;
+
+  /* Risk palette */
+  --color-risk-green: #16A34A;
+  --color-risk-yellow: #D97706;
+  --color-risk-orange: #EA580C;
+  --color-risk-red: #DC2626;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: var(--color-background);
+  color: var(--color-foreground);
+}
