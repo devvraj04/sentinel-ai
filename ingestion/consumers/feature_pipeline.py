@@ -97,7 +97,10 @@ class FeaturePipeline:
  
             # Write to Feast online store (Redis)
             self._write_to_feast(customer_id, signals)
- 
+
+            # Trigger full ML re-score → writes new Pulse Score to DynamoDB
+            self._trigger_pulse_score(customer_id)
+
             logger.debug(
                 "Signals computed",
                 customer_id=customer_id,
@@ -116,6 +119,28 @@ class FeaturePipeline:
         data["computed_at"] = signals.computed_at.isoformat()
         r.hset(key, mapping=data)
         r.expire(key, 86400)  # 24-hour TTL
+
+    def _trigger_pulse_score(self, customer_id: str) -> None:
+        """
+        After features are refreshed in Redis, call PulseScorer to:
+          1. Read the updated features from Redis
+          2. Run the LightGBM model
+          3. Write the new Pulse Score + risk tier to DynamoDB
+        This is what makes real-time transactions affect DynamoDB scores
+        via the full ML model path (as opposed to the delta-based update
+        done directly in the simulator).
+        """
+        try:
+            from serving.bentoml_service.pulse_scorer import get_scorer
+            scorer = get_scorer()
+            scorer.score(customer_id, force_refresh=True)
+            logger.debug("Pulse score updated via ML model", customer_id=customer_id)
+        except Exception as exc:
+            logger.warning(
+                "Pulse score update failed (non-fatal)",
+                customer_id=customer_id,
+                error=str(exc),
+            )
  
     def run(self) -> None:
         logger.info("Feature pipeline starting...")

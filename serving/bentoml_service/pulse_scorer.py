@@ -25,11 +25,15 @@ from typing import Optional
 import boto3
 import joblib
 import numpy as np
+import psycopg2
 import redis
 from botocore.config import Config
 
 from config.settings import get_settings
 from config.logging_config import get_logger
+from serving.bentoml_service.scoring_utils import (
+    pd_to_pulse_score, pulse_score_to_tier, get_intervention,
+)
 
 settings = get_settings()
 logger   = get_logger(__name__)
@@ -95,29 +99,10 @@ def _get_dynamodb_resource():
     )
 
 
-def _pd_to_pulse_score(pd_probability: float) -> int:
-    """
-    Sigmoid scaling: PD → Pulse Score 0-100.
-    PD < 0.10 → score < 25  (green)
-    PD ~ 0.30 → score ~ 50  (orange boundary)
-    PD > 0.60 → score > 70  (red)
-    """
-    scaled = 1.0 / (1.0 + np.exp(-10.0 * (pd_probability - 0.30)))
-    return max(1, min(100, int(round(scaled * 100))))
 
 
-def _get_risk_tier(pulse_score: int) -> str:
-    if pulse_score >= 70: return "red"
-    if pulse_score >= 45: return "orange"
-    if pulse_score >= 25: return "yellow"
-    return "green"
 
 
-def _get_intervention(risk_tier: str) -> tuple[bool, Optional[str]]:
-    if risk_tier == "red":    return True, "payment_holiday_or_restructuring"
-    if risk_tier == "orange": return True, "flexible_emi_offer"
-    if risk_tier == "yellow": return True, "preventive_digital_nudge"
-    return False, None
 
 
 def _connect_redis_safe() -> Optional[redis.Redis]:
@@ -161,7 +146,16 @@ def _get_features_from_redis(
         data = r.hgetall(key)
         if not data:
             return None
-        return {k.decode(): float(v) for k, v in data.items()}
+        features = {}
+        for k, v in data.items():
+            key_str = k.decode()
+            if key_str == "computed_at":   # timestamp string — skip, not a model feature
+                continue
+            try:
+                features[key_str] = float(v)
+            except (ValueError, TypeError):
+                continue   # skip any other non-numeric field silently
+        return features if features else None
     except Exception as e:
         logger.error("Redis retrieval failed", customer_id=customer_id, error=str(e))
         return None
@@ -203,6 +197,75 @@ def _write_score_to_dynamodb(dynamo, result: dict) -> None:
     except Exception as e:
         logger.error("DynamoDB write failed",
                      customer_id=result["customer_id"], error=str(e))
+
+
+def _write_score_to_postgres(result: dict) -> None:
+    """
+    Insert one row into pulse_score_history (PostgreSQL) so the score
+    timeline is permanently recorded with a timestamp.
+
+    Called immediately after _write_score_to_dynamodb() using the SAME
+    result dict, guaranteeing both stores carry the exact same score,
+    tier, PD, and factors at the exact same scored_at timestamp.
+
+    Every call produces a NEW history row. DynamoDB keeps the current
+    score (latest wins); PostgreSQL keeps every score ever computed.
+    """
+    try:
+        import json as _json
+        top_factors = result.get("top_factors", [])
+        f1 = top_factors[0]["feature_name"] if len(top_factors) > 0 else None
+        f2 = top_factors[1]["feature_name"] if len(top_factors) > 1 else None
+        f3 = top_factors[2]["feature_name"] if len(top_factors) > 2 else None
+        shap_json = _json.dumps([
+            {k: v for k, v in f.items() if k != "raw_value"}
+            for f in top_factors
+        ]) if top_factors else None
+
+        conn = psycopg2.connect(settings.database_url)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO pulse_score_history (
+                        customer_id, pulse_score, risk_tier, pd_probability,
+                        confidence, top_factor_1, top_factor_2, top_factor_3,
+                        shap_values, model_version,
+                        intervention_flag, intervention_type,
+                        scored_at
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        %s
+                    )
+                """, (
+                    result["customer_id"],
+                    result["pulse_score"],
+                    result["risk_tier"],
+                    round(result["pd_probability"], 6),
+                    round(result.get("confidence", 0.0), 4),
+                    f1, f2, f3,
+                    shap_json,
+                    result.get("model_version", "unknown"),
+                    result.get("intervention_recommended", False),
+                    result.get("intervention_type") or "none",
+                    result["scored_at"],
+                ))
+        conn.close()
+    except Exception as e:
+        logger.error("PostgreSQL pulse_score_history write failed",
+                     customer_id=result.get("customer_id"), error=str(e))
+
+
+def _write_score_to_both(dynamo, result: dict) -> None:
+    """
+    Single call-site that writes to DynamoDB (current score) AND
+    PostgreSQL (history row) using the same result dict.
+    Both stores always carry the exact same values.
+    """
+    _write_score_to_dynamodb(dynamo, result)
+    _write_score_to_postgres(result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -269,34 +332,109 @@ class PulseScorer:
             logger.error("SHAP failed", error=str(e))
             return []
 
-    def _fallback_score(self, customer_id: str) -> dict:
-        pd_prob     = round(np.random.uniform(0.02, 0.18), 4)
-        pulse_score = _pd_to_pulse_score(pd_prob)
-        risk_tier   = _get_risk_tier(pulse_score)
-        recommended, intervention_type = _get_intervention(risk_tier)
-        return {
-            "customer_id":              customer_id,
-            "pulse_score":              pulse_score,
-            "risk_tier":                risk_tier,
-            "pd_probability":           pd_prob,
-            "confidence":               0.5,
-            "top_factors":              [],
-            "intervention_recommended": recommended,
-            "intervention_type":        intervention_type,
-            "scored_at":                datetime.now(timezone.utc).isoformat(),
-            "model_version":            "fallback",
-            "cached":                   False,
-            "warning":                  "Model or Redis features unavailable",
-        }
+    def _last_known_score(self, customer_id: str) -> dict | None:
+        """
+        Read the most recent real score for this customer from PostgreSQL
+        pulse_score_history, then DynamoDB as a secondary fallback.
+        Returns None only if the customer has never been scored at all.
+        Never generates a random or hardcoded score.
+        """
+        # Primary: PostgreSQL pulse_score_history (full details)
+        try:
+            conn = psycopg2.connect(settings.database_url)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT pulse_score, risk_tier, pd_probability,
+                           confidence, top_factor_1, model_version, scored_at
+                    FROM pulse_score_history
+                    WHERE customer_id = %s
+                    ORDER BY scored_at DESC
+                    LIMIT 1
+                """, (customer_id,))
+                row = cur.fetchone()
+            conn.close()
+            if row:
+                score, tier, pd, conf, top_f, mv, scored_at = row
+                recommended, iv_type = get_intervention(tier)
+                return {
+                    "customer_id":              customer_id,
+                    "pulse_score":              int(score),
+                    "risk_tier":                tier,
+                    "pd_probability":           float(pd),
+                    "confidence":               float(conf or 0),
+                    "top_factors":              [{"feature_name": top_f,
+                                                  "contribution": 0,
+                                                  "human_readable": top_f or "",
+                                                  "direction": "increases_risk"}]
+                                               if top_f else [],
+                    "intervention_recommended": recommended,
+                    "intervention_type":        iv_type,
+                    "scored_at":                scored_at.isoformat() if scored_at else datetime.now(timezone.utc).isoformat(),
+                    "model_version":            mv or "cached",
+                    "cached":                   True,
+                    "warning":                  "Served from score history — Redis features unavailable",
+                }
+        except Exception as e:
+            logger.warning("PostgreSQL fallback read failed", customer_id=customer_id, error=str(e))
+
+        # Secondary: DynamoDB current score record
+        try:
+            if self._dynamo:
+                table = self._dynamo.Table(settings.dynamodb_table_scores)
+                resp  = table.get_item(Key={"customer_id": customer_id})
+                item  = resp.get("Item")
+                if item and item.get("pulse_score"):
+                    score = int(item["pulse_score"])
+                    tier  = item.get("risk_tier", pulse_score_to_tier(score))
+                    pd    = float(item.get("pd_probability", 0))
+                    recommended, iv_type = get_intervention(tier)
+                    return {
+                        "customer_id":              customer_id,
+                        "pulse_score":              score,
+                        "risk_tier":                tier,
+                        "pd_probability":           pd,
+                        "confidence":               float(item.get("confidence", 0)),
+                        "top_factors":              [],
+                        "intervention_recommended": recommended,
+                        "intervention_type":        iv_type,
+                        "scored_at":                item.get("updated_at", datetime.now(timezone.utc).isoformat()),
+                        "model_version":            item.get("model_version", "cached"),
+                        "cached":                   True,
+                        "warning":                  "Served from DynamoDB cache — Redis features unavailable",
+                    }
+        except Exception as e:
+            logger.warning("DynamoDB fallback read failed", customer_id=customer_id, error=str(e))
+
+        return None  # customer has never been scored
 
     def score(self, customer_id: str, force_refresh: bool = False) -> dict:
         features = _get_features_from_redis(self._redis, customer_id)
 
         if not features or self._model_package is None:
-            logger.warning("Using fallback scorer", customer_id=customer_id)
-            result = self._fallback_score(customer_id)
-            _write_score_to_dynamodb(self._dynamo, result)
-            return result
+            cached = self._last_known_score(customer_id)
+            if cached:
+                logger.info("Serving cached score — Redis features unavailable",
+                            customer_id=customer_id,
+                            pulse_score=cached["pulse_score"],
+                            source="history")
+                return cached   # do NOT write to history — score has not changed
+            # Truly no data at all — log and return error signal without writing
+            logger.warning("No score available — customer not yet scored",
+                           customer_id=customer_id)
+            return {
+                "customer_id":   customer_id,
+                "pulse_score":   None,
+                "risk_tier":     None,
+                "pd_probability":None,
+                "confidence":    None,
+                "top_factors":   [],
+                "intervention_recommended": False,
+                "intervention_type":        None,
+                "scored_at":     datetime.now(timezone.utc).isoformat(),
+                "model_version": "unscored",
+                "cached":        False,
+                "warning":       "Customer has not been scored yet. Run historical load first.",
+            }
 
         model        = self._model_package["model"]
         feature_cols = self._model_package["feature_cols"]
@@ -306,9 +444,9 @@ class PulseScorer:
         fv = np.array([features.get(col, 0.0) for col in feature_cols], dtype=float)
 
         pd_prob     = float(model.predict_proba(fv.reshape(1, -1))[0, 1])
-        pulse_score = _pd_to_pulse_score(pd_prob)
-        risk_tier   = _get_risk_tier(pulse_score)
-        recommended, intervention_type = _get_intervention(risk_tier)
+        pulse_score = pd_to_pulse_score(pd_prob)
+        risk_tier   = pulse_score_to_tier(pulse_score)
+        recommended, intervention_type = get_intervention(risk_tier)
         confidence  = float(abs(pd_prob - 0.5) * 2)
         top_factors = self._compute_shap(fv, feature_cols)
 
@@ -333,7 +471,7 @@ class PulseScorer:
             "cached":                   False,
         }
 
-        _write_score_to_dynamodb(self._dynamo, result)
+        _write_score_to_both(self._dynamo, result)
         return result
 
 
@@ -370,25 +508,58 @@ class SageMakerScorer:
                     endpoint=endpoint_name,
                     region=settings.aws_region)
 
-    def _fallback_score(self, customer_id: str) -> dict:
-        pd_prob     = round(np.random.uniform(0.02, 0.18), 4)
-        pulse_score = _pd_to_pulse_score(pd_prob)
-        risk_tier   = _get_risk_tier(pulse_score)
-        recommended, intervention_type = _get_intervention(risk_tier)
-        return {
-            "customer_id":              customer_id,
-            "pulse_score":              pulse_score,
-            "risk_tier":                risk_tier,
-            "pd_probability":           pd_prob,
-            "confidence":               0.5,
-            "top_factors":              [],
-            "intervention_recommended": recommended,
-            "intervention_type":        intervention_type,
-            "scored_at":                datetime.now(timezone.utc).isoformat(),
-            "model_version":            "sagemaker-fallback",
-            "cached":                   False,
-            "warning":                  "SageMaker endpoint unavailable",
-        }
+    def _last_known_score(self, customer_id: str) -> dict | None:
+        """
+        Read the most recent real score from PostgreSQL/DynamoDB.
+        Same logic as PulseScorer — no random, no hardcoded values.
+        """
+        try:
+            conn = psycopg2.connect(settings.database_url)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT pulse_score, risk_tier, pd_probability,
+                           confidence, top_factor_1, model_version, scored_at
+                    FROM pulse_score_history
+                    WHERE customer_id = %s
+                    ORDER BY scored_at DESC LIMIT 1
+                """, (customer_id,))
+                row = cur.fetchone()
+            conn.close()
+            if row:
+                score, tier, pd, conf, top_f, mv, scored_at = row
+                recommended, iv_type = get_intervention(tier)
+                return {
+                    "customer_id": customer_id, "pulse_score": int(score),
+                    "risk_tier": tier, "pd_probability": float(pd),
+                    "confidence": float(conf or 0), "top_factors": [],
+                    "intervention_recommended": recommended,
+                    "intervention_type": iv_type,
+                    "scored_at": scored_at.isoformat() if scored_at else datetime.now(timezone.utc).isoformat(),
+                    "model_version": mv or "cached", "cached": True,
+                    "warning": "SageMaker unavailable — serving cached score",
+                }
+        except Exception as e:
+            logger.warning("PostgreSQL fallback read failed", customer_id=customer_id, error=str(e))
+        try:
+            if self._dynamo:
+                table = self._dynamo.Table(settings.dynamodb_table_scores)
+                item = table.get_item(Key={"customer_id": customer_id}).get("Item")
+                if item and item.get("pulse_score"):
+                    score = int(item["pulse_score"])
+                    tier  = item.get("risk_tier", pulse_score_to_tier(score))
+                    recommended, iv_type = get_intervention(tier)
+                    return {
+                        "customer_id": customer_id, "pulse_score": score,
+                        "risk_tier": tier, "pd_probability": float(item.get("pd_probability", 0)),
+                        "confidence": float(item.get("confidence", 0)), "top_factors": [],
+                        "intervention_recommended": recommended, "intervention_type": iv_type,
+                        "scored_at": item.get("updated_at", datetime.now(timezone.utc).isoformat()),
+                        "model_version": item.get("model_version", "cached"), "cached": True,
+                        "warning": "SageMaker unavailable — serving DynamoDB cache",
+                    }
+        except Exception as e:
+            logger.warning("DynamoDB fallback read failed", customer_id=customer_id, error=str(e))
+        return None
 
     def score(self, customer_id: str, force_refresh: bool = False) -> dict:
         # Get features from Redis
@@ -418,7 +589,7 @@ class SageMakerScorer:
             # Add intervention recommendation if not returned by endpoint
             if "intervention_recommended" not in result:
                 tier = result.get("risk_tier", "green")
-                recommended, intervention_type = _get_intervention(tier)
+                recommended, intervention_type = get_intervention(tier)
                 result["intervention_recommended"] = recommended
                 result["intervention_type"]        = intervention_type
 
@@ -433,9 +604,21 @@ class SageMakerScorer:
                          customer_id=customer_id,
                          endpoint=self._endpoint,
                          error=str(e))
-            result = self._fallback_score(customer_id)
+            cached = self._last_known_score(customer_id)
+            if cached:
+                logger.info("Serving cached score — SageMaker unavailable",
+                            customer_id=customer_id, pulse_score=cached["pulse_score"])
+                return cached  # do NOT write — score unchanged
+            return {
+                "customer_id": customer_id, "pulse_score": None, "risk_tier": None,
+                "pd_probability": None, "confidence": None, "top_factors": [],
+                "intervention_recommended": False, "intervention_type": None,
+                "scored_at": datetime.now(timezone.utc).isoformat(),
+                "model_version": "unscored", "cached": False,
+                "warning": "Customer has not been scored yet.",
+            }
 
-        _write_score_to_dynamodb(self._dynamo, result)
+        _write_score_to_both(self._dynamo, result)
         return result
 
 

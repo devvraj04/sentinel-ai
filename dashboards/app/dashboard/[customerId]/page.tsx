@@ -50,8 +50,8 @@ interface ScoreImpactTxn {
   category: string;
   channel: string;
   status: string;
-  score_impact: number;
-  score_after: number;
+  score_impact: number | null;   // real delta between consecutive model scores; null if no history
+  score_after: number | null;    // real model score at this timestamp; null if no history
   impact_reason: string;
   is_stress_signal: boolean;
 }
@@ -71,7 +71,11 @@ interface PulseHistoryPoint {
   pulse_score: number;
   risk_tier: string;
   pd_probability: number;
+  confidence: number;
   top_factors: string[];
+  intervention_flag: boolean;
+  intervention_type: string;
+  model_version: string;
   scored_at: string;
 }
 
@@ -202,19 +206,46 @@ export default function CustomerDetailPage() {
   const [txnPage, setTxnPage] = useState(0);
   const TXN_PAGE_SIZE = 20;
 
-  // Load profile + score on mount
+  // Load profile (DynamoDB current score) + latest SHAP from history on mount.
+  // We do NOT call POST /score automatically — that would create a new history
+  // entry every time the page is opened. Score is only updated when the user
+  // explicitly clicks "Re-score" or when the real-time pipeline runs.
   useEffect(() => {
     setLoading(true);
     Promise.all([
       api.get(`/customers/${customerId}`),
-      api.post('/score', { customer_id: customerId }),
+      api.get(`/customers/${customerId}/pulse-history`, { params: { limit: 1 } }),
     ])
-      .then(([profRes, scoreRes]) => {
+      .then(([profRes, histRes]) => {
         setProfile(profRes.data);
-        setScoreData(scoreRes.data);
+        // Use the most recent history entry for SHAP top_factors if available
+        const latest = histRes.data?.history?.[0];
+        if (latest?.top_factors?.length) {
+          setScoreData({ top_factors: latest.top_factors.map((f: string, i: number) => ({
+            feature_name: f,
+            contribution: 1 / (i + 1),
+            human_readable: f.replace(/_/g, ' '),
+            direction: 'increases_risk' as const,
+            raw_value: 0,
+          })) });
+        }
       })
       .finally(() => setLoading(false));
   }, [customerId]);
+
+  // Manual re-score: calls the model, updates both stores, refreshes the page data
+  const [rescoring, setRescoring] = useState(false);
+  const handleRescore = () => {
+    setRescoring(true);
+    api.post('/score', { customer_id: customerId, force_refresh: true })
+      .then((res) => {
+        setScoreData(res.data);
+        // Refresh profile to pick up the new DynamoDB score
+        return api.get(`/customers/${customerId}`);
+      })
+      .then((res) => setProfile(res.data))
+      .finally(() => setRescoring(false));
+  };
 
   // Load tab data
   useEffect(() => {
@@ -235,7 +266,7 @@ export default function CustomerDetailPage() {
     }
     if (activeTab === 'history') {
       api
-        .get(`/customers/${customerId}/pulse-history`, { params: { limit: 30 } })
+        .get(`/customers/${customerId}/pulse-history`, { params: { limit: 200 } })
         .then((r) => setHistory(r.data.history));
     }
   }, [activeTab, customerId, txnPage]);
@@ -290,9 +321,17 @@ export default function CustomerDetailPage() {
           </span>
           {profile.intervention_flag && (
             <span className="px-3 py-1 bg-red-900/40 border border-red-500 text-red-400 rounded-full text-xs font-semibold">
-              ⚡ Intervention Recommended
+              Intervention Recommended
             </span>
           )}
+          <button
+            onClick={handleRescore}
+            disabled={rescoring}
+            className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition"
+            title="Run the LightGBM model now and update the score in all databases"
+          >
+            {rescoring ? 'Scoring…' : 'Re-score'}
+          </button>
         </div>
       </div>
 
@@ -318,11 +357,20 @@ export default function CustomerDetailPage() {
         {/* Gauge */}
         <div className="bg-gray-900 rounded-xl p-6 border border-gray-800 flex flex-col items-center">
           <h3 className="text-sm text-gray-400 mb-2">Pulse Score</h3>
-          <PulseGauge score={profile.pulse_score} tier={profile.risk_tier} />
-          <p className="text-xs text-gray-500 mt-2">
-            PD: {(profile.pd_probability * 100).toFixed(1)}% · Confidence:{' '}
-            {(profile.confidence * 100).toFixed(0)}%
-          </p>
+          {profile.pulse_score !== null && profile.pulse_score !== undefined ? (
+            <>
+              <PulseGauge score={profile.pulse_score} tier={profile.risk_tier} />
+              <p className="text-xs text-gray-500 mt-2">
+                PD: {(profile.pd_probability * 100).toFixed(1)}% · Confidence:{' '}
+                {profile.confidence !== null ? `${(profile.confidence * 100).toFixed(0)}%` : 'n/a'}
+              </p>
+            </>
+          ) : (
+            <div className="flex flex-col items-center justify-center h-32 gap-2">
+              <p className="text-gray-500 text-sm text-center">Not yet scored</p>
+              <p className="text-gray-600 text-xs text-center">Click Re-score to run the model</p>
+            </div>
+          )}
           {profile.intervention_type && (
             <p className="text-xs text-orange-400 mt-1 text-center">
               {profile.intervention_type.replace(/_/g, ' ')}
@@ -650,22 +698,33 @@ export default function CustomerDetailPage() {
                           <td className="py-2 pr-4 text-white">{txnLabel(t.txn_type)}</td>
                           <td className="py-2 pr-4 text-right font-mono">{fmt(t.amount)}</td>
                           <td className="py-2 pr-4 text-center">
-                            <span
-                              className={`font-bold text-base ${
-                                t.score_impact > 0
-                                  ? 'text-red-400'
-                                  : t.score_impact < 0
-                                    ? 'text-green-400'
-                                    : 'text-gray-500'
-                              }`}
-                            >
-                              {t.score_impact > 0
-                                ? `+${t.score_impact}`
-                                : t.score_impact || '—'}
-                            </span>
+                            {t.score_impact !== null && t.score_impact !== undefined ? (
+                              <span
+                                className={`font-bold text-base ${
+                                  t.score_impact > 0
+                                    ? 'text-red-400'
+                                    : t.score_impact < 0
+                                      ? 'text-green-400'
+                                      : 'text-gray-500'
+                                }`}
+                              >
+                                {t.score_impact > 0 ? `+${t.score_impact}` : t.score_impact === 0 ? '—' : t.score_impact}
+                              </span>
+                            ) : (
+                              <span className="text-gray-700 text-xs">—</span>
+                            )}
                           </td>
                           <td className="py-2 pr-4 text-center">
-                            <span className="font-mono font-bold text-white">{t.score_after}</span>
+                            {t.score_after !== null && t.score_after !== undefined ? (
+                              <span
+                                className="font-mono font-bold"
+                                style={{ color: TIER_COLORS[profile.risk_tier] || '#fff' }}
+                              >
+                                {t.score_after}
+                              </span>
+                            ) : (
+                              <span className="text-gray-700 text-xs">no history</span>
+                            )}
                           </td>
                           <td className="py-2 text-gray-400 text-xs">{t.impact_reason}</td>
                         </tr>
@@ -684,88 +743,144 @@ export default function CustomerDetailPage() {
       {/* ── Tab: Score History ─────────────────────────────────────────────── */}
       {activeTab === 'history' && (
         <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
-          <h3 className="text-base font-semibold mb-4">Pulse Score History</h3>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-base font-semibold">Pulse Score Timeline</h3>
+            <span className="text-xs text-gray-500">{history.length} records</span>
+          </div>
+
           {history.length > 0 ? (
             <>
-              <ResponsiveContainer width="100%" height={250}>
+              {/* ── Chart ── */}
+              <ResponsiveContainer width="100%" height={240}>
                 <LineChart data={[...history].reverse()}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                   <XAxis
                     dataKey="scored_at"
                     tickFormatter={(v) =>
-                      new Date(v).toLocaleDateString('en-IN', {
-                        day: '2-digit',
-                        month: 'short',
+                      new Date(v).toLocaleString('en-IN', {
+                        day: '2-digit', month: 'short',
+                        hour: '2-digit', minute: '2-digit',
                       })
                     }
                     tick={{ fill: '#9ca3af', fontSize: 10 }}
+                    interval="preserveStartEnd"
                   />
                   <YAxis domain={[0, 100]} tick={{ fill: '#9ca3af', fontSize: 11 }} />
                   <Tooltip
                     contentStyle={{ background: '#1f2937', border: '1px solid #374151' }}
                     labelFormatter={(v) => fmtDate(v)}
-                    formatter={(val, name) => [
-                      val,
-                      name === 'pulse_score' ? 'Pulse Score' : 'PD %',
+                    formatter={(val: number, name: string) => [
+                      name === 'pulse_score' ? val : `${(val * 100).toFixed(2)}%`,
+                      name === 'pulse_score' ? 'Pulse Score' : 'PD Probability',
                     ]}
                   />
-                  <ReferenceLine y={70} stroke="#ef4444" strokeDasharray="3 3" />
-                  <ReferenceLine y={45} stroke="#f97316" strokeDasharray="3 3" />
-                  <ReferenceLine y={25} stroke="#eab308" strokeDasharray="3 3" />
+                  <ReferenceLine y={70} stroke="#ef4444" strokeDasharray="3 3" label={{ value: 'Critical', fill: '#ef4444', fontSize: 10 }} />
+                  <ReferenceLine y={45} stroke="#f97316" strokeDasharray="3 3" label={{ value: 'At Risk', fill: '#f97316', fontSize: 10 }} />
+                  <ReferenceLine y={25} stroke="#eab308" strokeDasharray="3 3" label={{ value: 'Watch', fill: '#eab308', fontSize: 10 }} />
                   <Line
                     dataKey="pulse_score"
                     stroke="#3b82f6"
                     strokeWidth={2}
-                    dot={{ r: 3, fill: '#3b82f6' }}
+                    dot={({ cx, cy, payload }: any) => (
+                      <circle
+                        key={payload.scored_at}
+                        cx={cx} cy={cy} r={3}
+                        fill={TIER_COLORS[payload.risk_tier] || '#3b82f6'}
+                        stroke="none"
+                      />
+                    )}
                   />
                 </LineChart>
               </ResponsiveContainer>
-              <div className="mt-4 overflow-x-auto">
+
+              {/* ── Full timeline table ── */}
+              <div className="mt-5 overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="text-gray-400 border-b border-gray-800 text-left">
-                      <th className="py-2 pr-4">Scored At</th>
-                      <th className="py-2 pr-4 text-center">Score</th>
-                      <th className="py-2 pr-4">Tier</th>
-                      <th className="py-2 pr-4 text-right">PD %</th>
-                      <th className="py-2">Top Factors</th>
+                    <tr className="text-gray-400 border-b border-gray-700 text-left text-xs uppercase tracking-wide">
+                      <th className="py-2 pr-3">Timestamp</th>
+                      <th className="py-2 pr-3 text-center">Score</th>
+                      <th className="py-2 pr-3 text-center">Δ</th>
+                      <th className="py-2 pr-3">Tier</th>
+                      <th className="py-2 pr-3 text-right">PD %</th>
+                      <th className="py-2 pr-3">Top Factor</th>
+                      <th className="py-2 pr-3">Intervention</th>
+                      <th className="py-2 text-gray-600">Model</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {history.map((h, i) => (
-                      <tr key={i} className="border-b border-gray-800/40 hover:bg-gray-800/30">
-                        <td className="py-2 pr-4 text-gray-400 text-xs">
-                          {fmtDate(h.scored_at)}
-                        </td>
-                        <td className="py-2 pr-4 text-center">
-                          <span className="font-bold text-white">{h.pulse_score}</span>
-                        </td>
-                        <td className="py-2 pr-4">
-                          <span
-                            className="text-xs font-semibold px-2 py-0.5 rounded"
-                            style={{
-                              color: TIER_COLORS[h.risk_tier],
-                              background: `${TIER_COLORS[h.risk_tier]}22`,
-                            }}
-                          >
-                            {TIER_LABELS[h.risk_tier] || h.risk_tier}
-                          </span>
-                        </td>
-                        <td className="py-2 pr-4 text-right font-mono text-gray-300">
-                          {(h.pd_probability * 100).toFixed(1)}%
-                        </td>
-                        <td className="py-2 text-gray-400 text-xs">
-                          {h.top_factors.join(', ')}
-                        </td>
-                      </tr>
-                    ))}
+                    {history.map((h, i) => {
+                      const prev = history[i + 1];
+                      const delta = prev ? h.pulse_score - prev.pulse_score : null;
+                      const deltaColor =
+                        delta === null ? 'text-gray-600'
+                        : delta > 0 ? 'text-red-400'
+                        : delta < 0 ? 'text-green-400'
+                        : 'text-gray-500';
+                      const deltaStr =
+                        delta === null ? '—'
+                        : delta > 0 ? `+${delta}`
+                        : delta < 0 ? `${delta}`
+                        : '0';
+                      return (
+                        <tr
+                          key={h.scored_at + i}
+                          className="border-b border-gray-800/40 hover:bg-gray-800/30"
+                        >
+                          <td className="py-2 pr-3 text-gray-400 text-xs whitespace-nowrap">
+                            {fmtDate(h.scored_at)}
+                          </td>
+                          <td className="py-2 pr-3 text-center">
+                            <span
+                              className="font-bold text-sm"
+                              style={{ color: TIER_COLORS[h.risk_tier] || '#fff' }}
+                            >
+                              {h.pulse_score}
+                            </span>
+                          </td>
+                          <td className={`py-2 pr-3 text-center font-mono text-xs font-semibold ${deltaColor}`}>
+                            {deltaStr}
+                          </td>
+                          <td className="py-2 pr-3">
+                            <span
+                              className="text-xs font-semibold px-2 py-0.5 rounded"
+                              style={{
+                                color: TIER_COLORS[h.risk_tier],
+                                background: `${TIER_COLORS[h.risk_tier]}22`,
+                              }}
+                            >
+                              {TIER_LABELS[h.risk_tier] || h.risk_tier}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-3 text-right font-mono text-gray-300 text-xs">
+                            {(h.pd_probability * 100).toFixed(2)}%
+                          </td>
+                          <td className="py-2 pr-3 text-gray-400 text-xs max-w-[180px] truncate">
+                            {h.top_factors[0] || '—'}
+                          </td>
+                          <td className="py-2 pr-3">
+                            {h.intervention_flag ? (
+                              <span className="text-xs px-2 py-0.5 rounded bg-orange-500/20 text-orange-400 whitespace-nowrap">
+                                {h.intervention_type?.replace(/_/g, ' ') || 'yes'}
+                              </span>
+                            ) : (
+                              <span className="text-xs text-gray-700">—</span>
+                            )}
+                          </td>
+                          <td className="py-2 text-gray-700 text-xs font-mono">
+                            {h.model_version || '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             </>
           ) : (
-            <p className="text-gray-500">
-              No score history yet. Score this customer to start tracking.
+            <p className="text-gray-500 text-sm">
+              No score history yet. Scores are recorded here every time the
+              customer is scored — run the simulator or call POST /api/v1/score.
             </p>
           )}
         </div>

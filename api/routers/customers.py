@@ -294,11 +294,12 @@ async def get_customer_transactions(
 @router.get("/{customer_id}/pulse-history")
 async def get_pulse_history(
     customer_id: str,
-    limit: int = Query(30, le=180),
+    limit: int = Query(200, le=500),
 ):
     """
     Get Pulse Score history for a customer from PostgreSQL.
-    Shows how the score changed over time — used for trend charts.
+    Every score computation appends a row here — never updated, only inserted.
+    DynamoDB holds the current score; this endpoint exposes the full timeline.
     """
     try:
         conn = get_db_conn()
@@ -308,9 +309,13 @@ async def get_pulse_history(
                     pulse_score,
                     risk_tier,
                     pd_probability,
+                    confidence,
                     top_factor_1,
                     top_factor_2,
                     top_factor_3,
+                    intervention_flag,
+                    intervention_type,
+                    model_version,
                     scored_at
                 FROM pulse_score_history
                 WHERE customer_id = %s
@@ -322,17 +327,22 @@ async def get_pulse_history(
 
         history = []
         for row in rows:
-            score, tier, pd, f1, f2, f3, scored_at = row
+            score, tier, pd, conf, f1, f2, f3, iv_flag, iv_type, mv, scored_at = row
             history.append({
-                "pulse_score":    int(score),
-                "risk_tier":      tier,
-                "pd_probability": float(pd or 0),
-                "top_factors":    [f for f in [f1, f2, f3] if f],
-                "scored_at":      scored_at.isoformat() if scored_at else "",
+                "pulse_score":        int(score),
+                "risk_tier":          tier,
+                "pd_probability":     float(pd or 0),
+                "confidence":         float(conf or 0),
+                "top_factors":        [f for f in [f1, f2, f3] if f],
+                "intervention_flag":  bool(iv_flag) if iv_flag is not None else False,
+                "intervention_type":  iv_type or "none",
+                "model_version":      mv or "unknown",
+                "scored_at":          scored_at.isoformat() if scored_at else "",
             })
 
         return {
             "customer_id": customer_id,
+            "total":       len(history),
             "history":     history,
         }
 
@@ -346,15 +356,18 @@ async def get_transaction_score_impact(
     limit: int = Query(50, le=200),
 ):
     """
-    Returns recent transactions with their estimated impact on the Pulse Score.
-    Shows WHICH transactions are driving the risk score up or down.
+    Returns recent transactions with their impact on the Pulse Score,
+    anchored to the REAL scores recorded in pulse_score_history.
 
-    Impact is calculated from the stress signal flags —
-    each stress transaction contributes a score delta.
+    For each transaction we find the closest real scored_at entry in
+    pulse_score_history and attach that actual score — no simulation,
+    no hardcoded baseline. The score_after value shown is the real model
+    output that was written to both DynamoDB and PostgreSQL at that moment.
     """
     try:
         conn = get_db_conn()
         with conn.cursor() as cur:
+            # Fetch recent transactions
             cur.execute("""
                 SELECT
                     txn_type,
@@ -368,78 +381,100 @@ async def get_transaction_score_impact(
                 ORDER BY txn_timestamp DESC
                 LIMIT %s
             """, (customer_id, limit))
-            rows = cur.fetchall()
+            txn_rows = cur.fetchall()
+
+            # Fetch the full real score timeline for this customer
+            cur.execute("""
+                SELECT pulse_score, scored_at
+                FROM pulse_score_history
+                WHERE customer_id = %s
+                ORDER BY scored_at ASC
+            """, (customer_id,))
+            score_rows = cur.fetchall()
+
         conn.close()
 
-        # Score impact weights per transaction type
-        # Positive = increases risk, Negative = decreases risk
-        IMPACT_WEIGHTS = {
-            # Stress signals — increase score
-            ("auto_debit",    "failed"):        +8,
-            ("utility_payment","failed"):        +5,
-            ("upi_debit",     "lending_app"):    +7,
-            ("savings_withdrawal", None):        +4,
-            ("atm_withdrawal", None):            +3,
-            # Healthy signals — decrease score
-            ("salary_credit", "success"):        -6,
-            ("utility_payment", "success"):      -2,
-            ("credit_card_payment", "success"):  -1,
-        }
+        # Build a sorted list of (scored_at, pulse_score) for lookup
+        score_timeline = [
+            (row[1], int(row[0]))
+            for row in score_rows
+        ]  # sorted ASC by scored_at
+
+        def real_score_at(ts) -> Optional[int]:
+            """
+            Return the real pulse score that was active at timestamp ts.
+            Uses the most recent score entry whose scored_at <= ts.
+            Falls back to the earliest score if ts precedes all history.
+            Returns None if no history exists at all.
+            """
+            if not score_timeline:
+                return None
+            best = score_timeline[0][1]
+            for scored_at, score in score_timeline:
+                if scored_at <= ts:
+                    best = score
+                else:
+                    break
+            return best
+
+        # Classify transaction type for display labels only.
+        # score_impact delta is computed from the REAL score timeline, not hardcoded weights.
+        def classify_txn(txn_type: str, category: str,
+                         status: str, amount: float) -> tuple[str, bool]:
+            """Returns (human-readable reason, is_stress_signal) for display."""
+            if status == "failed" and txn_type == "auto_debit":
+                return "Failed EMI payment — major stress signal", True
+            if status == "failed" and txn_type == "utility_payment":
+                return "Failed utility payment — cash flow stress", True
+            if category == "lending_app":
+                return "Borrowed from lending app — debt stress", True
+            if txn_type == "savings_withdrawal" and amount > 5_000:
+                return "Large savings withdrawal — buffer erosion", True
+            if txn_type == "atm_withdrawal" and amount >= 5_000:
+                return "Large ATM withdrawal — cash hoarding", True
+            if txn_type == "salary_credit" and status == "success":
+                return "Salary received — positive cashflow", False
+            if txn_type == "utility_payment" and status == "success":
+                return "Utility paid on time — financial discipline", False
+            return "neutral transaction", False
 
         result = []
-        running_score = 50  # approximate neutral baseline
+        prev_score: Optional[int] = None
 
-        for row in reversed(rows):  # process oldest first for running score
-            txn_type, amount, category, status, channel, ts = row
+        for txn_type, amount, category, status, channel, ts in txn_rows:
+            amt         = float(amount or 0)
+            reason, is_stress = classify_txn(txn_type or "", category or "",
+                                             status or "", amt)
+            # score_after: real model score active at this transaction timestamp
+            score_after = real_score_at(ts) if ts else None
 
-            # Determine impact
-            impact = 0
-            reason = "neutral"
+            # score_impact: actual delta between consecutive real scores.
+            # None if we have no history data. Never hardcoded.
+            if score_after is not None and prev_score is not None:
+                score_impact = score_after - prev_score
+            else:
+                score_impact = None
 
-            if status == "failed" and txn_type == "auto_debit":
-                impact = +8
-                reason = "Failed EMI payment — major stress signal"
-            elif status == "failed" and txn_type == "utility_payment":
-                impact = +5
-                reason = "Failed utility payment — cash flow stress"
-            elif category == "lending_app":
-                impact = +7
-                reason = "Borrowed from lending app — debt stress"
-            elif txn_type == "savings_withdrawal" and amount > 5000:
-                impact = +4
-                reason = "Large savings withdrawal — buffer erosion"
-            elif txn_type == "atm_withdrawal" and amount >= 5000:
-                impact = +3
-                reason = "Large ATM withdrawal — cash hoarding"
-            elif txn_type == "salary_credit" and status == "success":
-                impact = -6
-                reason = "Salary received — positive cashflow"
-            elif txn_type == "utility_payment" and status == "success":
-                impact = -2
-                reason = "Utility paid on time — financial discipline"
-
-            running_score = max(1, min(100, running_score + impact))
+            prev_score = score_after if score_after is not None else prev_score
 
             result.append({
-                "txn_timestamp":   ts.isoformat() if ts else "",
-                "txn_type":        txn_type or "",
-                "amount":          float(amount or 0),
-                "category":        category or "other",
-                "channel":         channel or "unknown",
-                "status":          status or "success",
-                "score_impact":    impact,
-                "score_after":     running_score,
-                "impact_reason":   reason,
-                "is_stress_signal":impact > 0,
+                "txn_timestamp":  ts.isoformat() if ts else "",
+                "txn_type":       txn_type or "",
+                "amount":         amt,
+                "category":       category or "other",
+                "channel":        channel or "unknown",
+                "status":         status or "success",
+                "score_impact":   score_impact,   # real delta, or null if no history
+                "score_after":    score_after,    # real model score, or null if no history
+                "impact_reason":  reason,
+                "is_stress_signal": is_stress,
             })
-
-        # Return newest first
-        result.reverse()
 
         return {
             "customer_id":        customer_id,
             "transactions":       result,
             "total_transactions": len(result),
+            "score_source":       "pulse_score_history" if score_timeline else "unavailable",
         }
 
     except Exception as e:
