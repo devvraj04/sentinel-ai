@@ -32,7 +32,7 @@ from botocore.config import Config
 from config.settings import get_settings
 from config.logging_config import get_logger
 from serving.bentoml_service.scoring_utils import (
-    pd_to_pulse_score, pulse_score_to_tier, get_intervention,
+    pd_to_pulse_score, pulse_score_to_tier, get_intervention, set_sigmoid_center
 )
 
 settings = get_settings()
@@ -56,6 +56,7 @@ FEATURE_LABELS = {
     "failed_auto_debit_amount":  "EMI auto-debit failures by amount",
     "failed_utility_count":      "Failed utility payments",
     "credit_utilization_delta":  "Rising credit card utilization",
+    "credit_enquiries_3m":       "Credit enquiries (approximate proxy via failed auto-debits)",
     "drift_salary":              "Salary drift score",
     "drift_balance":             "Balance drift score",
     "drift_lending":             "Lending app drift score",
@@ -289,6 +290,8 @@ class PulseScorer:
         # Model
         if os.path.exists(MODEL_PATH):
             self._model_package = joblib.load(MODEL_PATH)
+            if "threshold" in self._model_package:
+                set_sigmoid_center(self._model_package["threshold"])
             logger.info("LightGBM model loaded (local)",
                         version=self._model_package.get("version"),
                         cv_auc=self._model_package.get("cv_auc"))

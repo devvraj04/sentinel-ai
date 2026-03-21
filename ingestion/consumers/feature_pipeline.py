@@ -120,39 +120,51 @@ class FeaturePipeline:
         self._event_counts[cid] += 1
  
     def _compute_and_store(self, customer_id: str) -> None:
-        """Compute behavioral signals and write to Feast online store."""
+        """Compute all 46 features using the verified Indian context feature builder."""
         buf = self._buffers.get(customer_id, [])
         if not buf:
             return
         try:
             df = pd.DataFrame(buf)
             df["txn_timestamp"] = pd.to_datetime(df["txn_timestamp"], utc=True)
-            signals = self.engine.compute(customer_id, df)
- 
-            # Write to Feast online store (Redis)
-            self._write_to_feast(customer_id, signals)
 
-            # Trigger full ML re-score → writes new Pulse Score to DynamoDB
+            # 1. Fetch live customer profile from PostgreSQL to get salary, loans, segment, etc.
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(settings.database_url, cursor_factory=psycopg2.extras.RealDictCursor)
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM customers WHERE customer_id = %s", (customer_id,))
+                customer = cur.fetchone()
+            conn.close()
+
+            if not customer:
+                logger.warning("Customer profile not found in Postgres, skipping features", customer_id=customer_id)
+                return
+
+            # 2. Compute the exact 46 features expected by LightGBM
+            from sagemaker.inference import build_feature_vector
+            ref_date = df["txn_timestamp"].max() if not df.empty else datetime.now(timezone.utc)
+            features_dict = build_feature_vector(customer, df, ref_date)
+ 
+            # 3. Write all 46 features to Feast online store (Redis)
+            import redis as redis_lib
+            r = redis_lib.from_url(settings.redis_url)
+            key = f"sentinel:features:{customer_id}"
+            data = {k: str(v) for k, v in features_dict.items()}
+            data["computed_at"] = datetime.now(timezone.utc).isoformat()
+            r.hset(key, mapping=data)
+            r.expire(key, 86400)  # 24-hour TTL
+
+            # 4. Trigger full ML re-score → writes new Pulse Score to DynamoDB
             self._trigger_pulse_score(customer_id)
 
             logger.debug(
-                "Signals computed",
+                "Features computed and scored via LightGBM",
                 customer_id=customer_id,
-                drift_score=round(signals.drift_score, 3),
-                has_stress=signals.has_early_stress(),
+                feature_count=len(features_dict)
             )
         except Exception as exc:
             logger.error("Signal computation failed", customer_id=customer_id, error=str(exc))
- 
-    def _write_to_feast(self, customer_id: str, signals) -> None:
-        """Write computed signals to Feast online store via direct Redis write."""
-        import redis as redis_lib
-        r = redis_lib.from_url(settings.redis_url)
-        key = f"sentinel:features:{customer_id}"
-        data = {k: str(v) for k, v in signals.to_feature_vector().items()}
-        data["computed_at"] = signals.computed_at.isoformat()
-        r.hset(key, mapping=data)
-        r.expire(key, 86400)  # 24-hour TTL
 
     def _trigger_pulse_score(self, customer_id: str) -> None:
         """
