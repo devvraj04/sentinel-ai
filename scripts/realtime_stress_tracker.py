@@ -38,34 +38,34 @@ STRESS_SIGNALS = {
                                     and row["payment_status"] == "failed"),
         "label":        "⚠  Failed Auto-Debit (EMI missed)",
         "severity":     "HIGH",
-        "score_impact": "+8",
+        "score_impact": "model-derived",
     },
     "lending_app_upi": {
         "condition":    lambda row: row["merchant_category"] == "lending_app",
         "label":        "⚠  Borrowed from Lending App",
         "severity":     "HIGH",
-        "score_impact": "+7",
+        "score_impact": "model-derived",
     },
     "large_atm_withdrawal": {
         "condition":    lambda row: (row["txn_type"] == "atm_withdrawal"
                                     and float(row["amount"] or 0) >= 5000),
         "label":        "⚡ Large ATM Withdrawal (cash hoarding)",
         "severity":     "MEDIUM",
-        "score_impact": "+4",
+        "score_impact": "model-derived",
     },
     "failed_utility": {
         "condition":    lambda row: (row["txn_type"] == "utility_payment"
                                     and row["payment_status"] == "failed"),
         "label":        "⚡ Failed Utility Payment",
         "severity":     "MEDIUM",
-        "score_impact": "+5",
+        "score_impact": "model-derived",
     },
     "large_savings_drain": {
         "condition":    lambda row: (row["txn_type"] == "savings_withdrawal"
                                     and float(row["amount"] or 0) >= 10000),
         "label":        "⚡ Large Savings Withdrawal",
         "severity":     "MEDIUM",
-        "score_impact": "+4",
+        "score_impact": "model-derived",
     },
 }
 

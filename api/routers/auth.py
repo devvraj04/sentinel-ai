@@ -36,14 +36,51 @@ class TokenData(BaseModel):
 def create_access_token(data: dict) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
     return jwt.encode({**data, "exp": expire}, settings.secret_key, algorithm=settings.jwt_algorithm)
- 
- 
+
+
+def _get_db_connection():
+    """Get a synchronous psycopg2 connection for user lookup."""
+    import psycopg2
+    import psycopg2.extras
+    return psycopg2.connect(
+        settings.database_url,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+
+
 @router.post("/login", response_model=Token)
 async def login(form: OAuth2PasswordRequestForm = Depends()):
-    """Authenticate user and return JWT token."""
-    # In production: query PostgreSQL for the user
-    # For dev: accept the default admin user
-    if form.username == "admin@sentinel.bank" and form.password == "sentinel_admin":
-        token = create_access_token({"sub": "admin-001", "role": "admin", "name": "System Admin"})
-        return Token(access_token=token, token_type="bearer", role="admin", full_name="System Admin")
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    """Authenticate user against PostgreSQL users table with bcrypt verification."""
+    try:
+        conn = _get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, email, full_name, role, password_hash FROM users WHERE email = %s AND is_active = TRUE",
+                (form.username,),
+            )
+            user = cur.fetchone()
+        conn.close()
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service unavailable",
+        )
+
+    if not user or not pwd_context.verify(form.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+
+    token = create_access_token({
+        "sub": str(user["id"]),
+        "role": user["role"],
+        "name": user["full_name"],
+    })
+    return Token(
+        access_token=token,
+        token_type="bearer",
+        role=user["role"],
+        full_name=user["full_name"],
+    )
+

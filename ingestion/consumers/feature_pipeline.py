@@ -4,7 +4,7 @@ ingestion/consumers/feature_pipeline.py
 Kafka consumer that:
 1. Reads enriched transaction events from 'transactions-enriched' topic
 2. Accumulates a 90-day window of transactions per customer in memory
-3. Every N events per customer: recomputes all 8 behavioral signals
+3. Recomputes all behavioral signals on EVERY transaction (real-time)
 4. Writes signals to Feast Online Store (Redis) for real-time scoring
 5. Also writes to PostgreSQL for offline training data
  
@@ -32,15 +32,13 @@ from ingestion.schemas.transaction_event import TransactionEvent
 setup_logging()
 logger = get_logger(__name__)
 settings = get_settings()
- 
-# How many new events per customer before recomputing signals
-RECOMPUTE_EVERY_N_EVENTS = 5
+
 # Max transactions to keep in memory per customer (90 days approx)
 MAX_TXN_HISTORY = 500
  
  
 class FeaturePipeline:
-    """Real-time feature computation pipeline."""
+    """Real-time feature computation pipeline — scores EVERY transaction."""
  
     def __init__(self) -> None:
         self.engine = BehavioralSignalEngine()
@@ -49,9 +47,48 @@ class FeaturePipeline:
         self._event_counts: dict[str, int] = defaultdict(int)
         self._running = True
  
+        self._warm_start()
+
         # Graceful shutdown on Ctrl+C or SIGTERM
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
+
+    def _warm_start(self) -> None:
+        """Pre-load recent transactions from PostgreSQL to avoid empty baseline on restart."""
+        try:
+            import psycopg2
+            import psycopg2.extras
+            logger.info("Warm-starting buffers from PostgreSQL...")
+            conn = psycopg2.connect(settings.database_url, cursor_factory=psycopg2.extras.RealDictCursor)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT customer_id, amount, txn_type, merchant_category, 
+                           payment_status, account_type, txn_timestamp
+                    FROM transactions 
+                    WHERE txn_timestamp >= NOW() - INTERVAL '30 days'
+                    ORDER BY txn_timestamp ASC
+                """)
+                for row in cur.fetchall():
+                    cid = row["customer_id"]
+                    # Format correctly as strings/bools as expected by the signal engine
+                    event = {
+                        "customer_id": cid,
+                        "amount": float(row["amount"]),
+                        "txn_type": row["txn_type"],
+                        "merchant_category": row["merchant_category"] or "unknown",
+                        "payment_status": row["payment_status"] or "completed",
+                        "account_type": row["account_type"] or "savings",
+                        "txn_timestamp": row["txn_timestamp"].isoformat(),
+                        "is_lending_app_upi": row["merchant_category"] == "lending_app",
+                        "is_auto_debit_failed": row["txn_type"] == "auto_debit" and row["payment_status"] == "failed"
+                    }
+                    self._buffer_event(event)
+
+            conn.close()
+            logger.info("Warm-start complete", total_events=sum(len(b) for b in self._buffers.values()))
+        except Exception as e:
+            logger.warning("Warm-start failed, starting with empty buffers", error=str(e))
+
  
     def _shutdown(self, *args) -> None:
         logger.info("Shutting down feature pipeline...")
@@ -81,9 +118,6 @@ class FeaturePipeline:
         if len(buf) > MAX_TXN_HISTORY:
             self._buffers[cid] = buf[-MAX_TXN_HISTORY:]
         self._event_counts[cid] += 1
- 
-    def _should_recompute(self, customer_id: str) -> bool:
-        return self._event_counts[customer_id] % RECOMPUTE_EVERY_N_EVENTS == 0
  
     def _compute_and_store(self, customer_id: str) -> None:
         """Compute behavioral signals and write to Feast online store."""
@@ -127,8 +161,7 @@ class FeaturePipeline:
           2. Run the LightGBM model
           3. Write the new Pulse Score + risk tier to DynamoDB
         This is what makes real-time transactions affect DynamoDB scores
-        via the full ML model path (as opposed to the delta-based update
-        done directly in the simulator).
+        via the full ML model path.
         """
         try:
             from serving.bentoml_service.pulse_scorer import get_scorer
@@ -143,7 +176,7 @@ class FeaturePipeline:
             )
  
     def run(self) -> None:
-        logger.info("Feature pipeline starting...")
+        logger.info("Feature pipeline starting (real-time mode: scoring every transaction)...")
         consumer = self._get_consumer()
         processed = 0
  
@@ -155,7 +188,8 @@ class FeaturePipeline:
                         try:
                             self._buffer_event(msg.value)
                             cid = msg.value.get("customer_id", "")
-                            if cid and self._should_recompute(cid):
+                            # Score EVERY transaction — no throttling
+                            if cid:
                                 self._compute_and_store(cid)
                             processed += 1
                             if processed % 1000 == 0:

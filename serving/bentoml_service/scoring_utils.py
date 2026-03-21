@@ -3,15 +3,13 @@ serving/bentoml_service/scoring_utils.py
 ──────────────────────────────────────────────────────────────────────────────
 SINGLE SOURCE OF TRUTH for all pulse score calculations.
 
-Sigmoid calibration (why k=8, center=0.42):
-  - The LightGBM model's own decision threshold is PD = 0.42.
-  - We set center=0.42 so a customer exactly at the model threshold
-    gets Pulse Score = 50 (mid-orange).
-  - k=8 (was 10) gives a gentler curve so realistic PD distributions
-    (0.05–0.80) map across the full 0–100 score range instead of
-    clustering near the extremes.
+Sigmoid calibration:
+  - center is loaded from model package threshold at runtime via
+    set_sigmoid_center(). Defaults to 0.42 if not set.
+  - k=8 gives a gentle curve so realistic PD distributions (0.05–0.80)
+    map across the full 0–100 score range.
 
-Resulting tier boundaries:
+Tier boundaries:
   PD < 15%   → score < 25  → green   (safe, low risk)
   PD 15–28%  → score 25–44 → yellow  (watch)
   PD 28–55%  → score 45–69 → orange  (at risk)
@@ -29,21 +27,35 @@ THRESHOLD_RED    = 70
 THRESHOLD_ORANGE = 45
 THRESHOLD_YELLOW = 25
 
-# ── Sigmoid parameters — calibrated to model decision threshold ───────────────
-# center = model threshold (0.42) → PD at threshold maps to score 50
-# k      = steepness (8 gives realistic spread across full PD range)
-_SIGMOID_CENTER = 0.42
+# ── Sigmoid parameters ───────────────────────────────────────────────────────
+# center is dynamically set from model threshold via set_sigmoid_center()
+# DO NOT hardcode — call set_sigmoid_center() at model load time
+_SIGMOID_CENTER = 0.42   # default; overridden at runtime
 _SIGMOID_K      = 8.0
+
+
+def set_sigmoid_center(center: float) -> None:
+    """
+    Set the sigmoid center from the model's optimal threshold.
+    Call this once at model load time (e.g., from pulse_scorer.py or inference.py).
+    """
+    global _SIGMOID_CENTER
+    _SIGMOID_CENTER = center
+
+
+def get_sigmoid_center() -> float:
+    """Return current sigmoid center for diagnostics."""
+    return _SIGMOID_CENTER
 
 
 def pd_to_pulse_score(pd_probability: float) -> int:
     """
     Convert PD probability → Pulse Score 0–100.
 
-    Calibrated to the LightGBM model's threshold (0.42):
-      PD = 0.42  → score = 50  (centre of orange tier)
-      PD = 0.10  → score =  7  (green, low risk)
-      PD = 0.60  → score = 81  (red, critical)
+    Calibrated to the model's threshold (set via set_sigmoid_center):
+      PD = center → score = 50  (centre of risk boundary)
+      PD = 0.10   → score ~7   (green, low risk)
+      PD = 0.60   → score ~81  (red, critical)
     """
     scaled = 1.0 / (1.0 + math.exp(-_SIGMOID_K * (float(pd_probability) - _SIGMOID_CENTER)))
     return max(1, min(100, int(round(scaled * 100))))

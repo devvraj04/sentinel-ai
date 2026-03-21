@@ -58,10 +58,7 @@ class Settings(BaseSettings):
     mlflow_tracking_uri: str = "http://localhost:5001"
     mlflow_experiment_name: str = "sentinel-risk-models"
  
-    # Model thresholds
-    pulse_score_high_risk: int = 75
-    pulse_score_moderate_risk: int = 50
-    pulse_score_low_risk: int = 30
+    # Model thresholds (tier thresholds are in scoring_utils.py — single source of truth)
     drift_threshold: float = 1.5
     psi_threshold: float = 0.25
     air_threshold: float = 0.80

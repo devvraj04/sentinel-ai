@@ -1,0 +1,1052 @@
+
+SENTINEL
+Pre-Delinquency Intervention Engine
+
+
+COMPLETE IMPLEMENTATION PLAN
+Open-Source Stack  |  Industry-Grade Architecture  |  RBI & Basel III Compliant
+
+
+"Financial distress is gradual. Detection systems must be continuous."
+
+Table of Contents
+This document is organized into 12 major sections covering every layer of the Sentinel system — from raw data ingestion to regulatory compliance, dashboard visualization, and future roadmap.
+
+
+1. Executive Summary
+1.1 The Problem
+Banks globally are caught in a reactive delinquency cycle. Traditional collections systems trigger only after a customer has missed a payment — typically 30+ Days Past Due (DPD). At that stage, the Expected Credit Loss (ECL) has already materialized, the customer relationship is strained, and collection costs — ranging from 15–20% of the recovered amount — have begun to accumulate.
+
+The core insight driving Sentinel is straightforward but powerful: financial distress does not begin at the first missed payment. It begins weeks earlier, embedded in subtle behavioral signals — a salary arriving 5 days late, a creeping balance on a lending UPI app, utilities paid in the last 2 days of a billing cycle, and a gradual drawdown of savings. These signals are individually weak but collectively definitive.
+
+
+1.2 Sentinel's Answer
+Sentinel is a real-time, open-source Pre-Delinquency Intervention Engine that:
+Ingests transaction events in real-time via Apache Kafka (< 50ms end-to-end latency).
+Detects behavioral drift by comparing 7–14 day rolling behavioral windows against each customer's personal historical baseline.
+Scores every customer continuously using a dual-model stack: LightGBM (structured signals) + LSTM (temporal sequences), producing a Pulse Score (0–100).
+Triggers tiered, empathetic interventions (payment holiday, flexible EMI, digital nudge) before the first payment is missed.
+Provides full SHAP-based explainability for every risk score, with immutable audit logs meeting RBI, IFRS 9, and Basel III requirements.
+
+1.3 Quantified Impact
+
+2. System Architecture Overview
+2.1 Architectural Philosophy
+Sentinel is built on three core architectural principles that distinguish it from legacy delinquency detection systems:
+
+Event-Driven, Not Batch-Driven — every customer transaction immediately flows into the scoring pipeline. There is no overnight batch job creating a 24-hour detection blind spot.
+Personalized Baseline, Not Global Threshold — risk is measured against each customer's own historical behavioral pattern, not a generic population threshold. This dramatically reduces false positives.
+Explainability by Design, Not by Afterthought — SHAP feature attribution is computed alongside every Pulse Score, not retrofitted. Every decision is audit-ready from day one.
+
+2.2 High-Level System Architecture
+The Sentinel architecture is structured as five sequentially interdependent layers, each with distinct responsibilities and technology choices:
+
+
+2.3 End-to-End Data Flow
+The following describes the complete journey of a transaction event through the Sentinel system, from bank core system to customer intervention:
+
+
+
+3. Data Architecture & Sources
+3.1 Data Sources Catalog
+Sentinel ingests data from multiple product silos within the bank, unifying them into a single behavioral intelligence view per customer. The following catalog defines every source, its ingestion mode, schema, and update frequency.
+
+3.1.1 Core Transaction Data
+
+3.1.2 Salary & Income Data
+
+3.1.3 Loan & EMI Obligation Data
+
+3.1.4 Credit & Utilization Data
+
+3.1.5 Spending Category Data
+
+3.2 Data Contracts & Schema Registry
+All data flowing through Sentinel is governed by an Apache Avro schema registry (Confluent Schema Registry — open-source). This enforces:
+Schema versioning with backward and forward compatibility enforcement.
+Automatic schema evolution — adding optional nullable fields without breaking downstream consumers.
+JSON Schema validation at ingestion for REST-based producers.
+Schema fingerprinting for audit trails (each schema version has a unique hash stored in MLflow artifacts).
+
+
+4. Streaming & Event-Driven Pipeline
+4.1 Apache Kafka — Topic Design
+Kafka is the central nervous system of Sentinel. All inter-service communication is asynchronous and event-driven through well-defined topics. Below is the complete topic taxonomy:
+
+
+4.2 Kafka Configuration — Production Hardening
+
+4.3 Apache Flink — Stream Processing Jobs
+Apache Flink provides stateful, exactly-once stream processing with event-time semantics and watermarking — critical for accurate behavioral window computations even in the presence of late-arriving events.
+
+4.3.1 Job 1: Transaction Enrichment Job
+Input: sentinel.raw.transactions Kafka topic
+Processing: Enriches each transaction with customer profile data (income, loan obligations, credit limit) via an async lookup to Redis (customer profile cache, TTL 24h).
+Windowing: No windowing — pure event-time enrichment with a 30-second event-time watermark for late arrivals.
+Output: sentinel.enriched.events topic (Avro encoded)
+Parallelism: 16 task slots (scales to 64 at peak)
+State backend: RocksDB (persistent, incremental checkpoints to S3/MinIO every 60 seconds)
+
+4.3.2 Job 2: Behavioral Feature Computation Job
+This is the most critical Flink job. It maintains per-customer stateful windows and computes all behavioral drift signals.
+
+Input: sentinel.enriched.events
+Key by: customer_id (ensures all events for a customer go to the same task slot)
+Windows computed:
+7-day tumbling window: salary credits, ATM withdrawals, UPI lending transfers, discretionary spend totals
+14-day sliding window (slides every 1 day): credit utilization rolling average, balance trend
+30-day session window (gap 24h): utility payment timing pattern detection
+State management: Each customer maintains a circular buffer of 90 days of daily aggregates in Flink's RocksDB state backend.
+Output: Writes computed features to Feast online store (Redis) AND sentinel.features.customer Kafka topic.
+Late data handling: Events arriving up to 1 hour late are accepted and state is recomputed.
+
+4.3.3 Job 3: Salary Timing Drift Detector
+A specialized Flink Complex Event Processing (CEP) job.
+Pattern: Detects 'SALARY_CREDIT not received within expected_salary_day + 3 days' for any customer with a known employer.
+Uses Flink CEP library with a PATTERN that matches: [salary_expected_window passes] -> [no salary event received] -> [emit drift alert].
+Output: Enriches feature vector with salary_delay_days = current_day - expected_salary_day.
+
+5. Feature Engineering & Feature Store
+5.1 Feast Feature Store Architecture
+Feast (Feature Store) is the single source of truth for all ML features in Sentinel. It enforces training-serving consistency — the exact same feature pipeline that serves the model in production also generates the training dataset. This eliminates training-serving skew, which is the #1 cause of production model degradation in ML systems.
+
+
+5.2 Complete Behavioral Feature Catalog
+The following 47 features are registered in Feast and used by Sentinel models. They are organized into 7 logical feature groups (Feature Views in Feast terminology):
+
+Feature View 1: salary_features (TTL: 35 days)
+
+Feature View 2: balance_liquidity_features (TTL: 14 days)
+
+Feature View 3: credit_utilization_features (TTL: 7 days)
+
+Feature View 4: payment_behavior_features (TTL: 30 days)
+
+Feature View 5: spending_behavior_features (TTL: 14 days)
+
+Feature View 6: cross_product_aggregates (TTL: 7 days)
+
+Feature View 7: customer_context_features (TTL: 90 days — slow changing)
+
+6. ML Model Design & Training
+6.1 Model Architecture — Dual-Model Ensemble
+Sentinel uses a two-model ensemble approach. Each model captures a different aspect of customer risk, and their outputs are combined through a meta-learner that is calibrated to minimize Expected Credit Loss (ECL), not raw accuracy.
+
+
+6.1.1 Model A: LightGBM — Structured Behavioral Risk Classifier
+
+6.1.2 Model B: LSTM — Temporal Sequence Risk Model
+The LSTM model processes each customer's transaction history as a time-ordered sequence, learning behavioral patterns that unfold over weeks — patterns that a snapshot-based model cannot detect.
+
+
+6.1.3 Meta-Learner: ECL-Optimized Ensemble
+
+6.2 Training Data Pipeline
+6.2.1 Label Generation
+Positive label (delinquency = 1): Customer had DPD ≥ 1 in a 30-day window following the feature snapshot date.
+Negative label (no delinquency = 0): Customer had zero DPD in the 30-day window following the feature snapshot.
+Label horizon: Features are computed at T=0, label is observed at T+14 to T+28 days. This simulates the 2–4 week early detection target.
+Label leakage prevention: Strict temporal split — training data uses features computed before a cutoff date; validation and test data use features computed after. No future information is used in feature computation.
+
+6.2.2 Class Imbalance Handling
+Typical delinquency rate: 2–5% of portfolio. This creates extreme class imbalance.
+Techniques applied (in order of application):
+SMOTE (Synthetic Minority Oversampling Technique): Generate synthetic minority class samples in feature space using k-nearest-neighbors interpolation. Applied only on training set, never on validation or test sets.
+Tomek Links: Remove majority class samples that are closest to minority class (borderline cleanup after SMOTE).
+Class weights: scale_pos_weight = (n_negative / n_positive) in LightGBM; pos_weight tensor in PyTorch LSTM.
+Focal Loss (optional): For extreme imbalance cases, replace BCE with Focal Loss (gamma=2, alpha=0.25) to focus learning on hard-to-classify minority examples.
+
+6.2.3 Training Infrastructure
+Offline training: Apache Airflow DAG triggers monthly full retraining using 18 months of historical data from the Feast offline store (PostgreSQL + Parquet).
+Point-in-time correct feature retrieval: Feast's get_historical_features() ensures features are retrieved as they appeared at the label timestamp — preventing data leakage.
+Training environment: Docker container with GPU support (pytorch:2.x-cuda11.8), launched by Airflow on a GPU-enabled machine (or Kubernetes job with GPU node selector).
+Hyperparameter tuning: Optuna with TPE sampler, 100 trials, 5-fold time-series cross-validation (TimeSeriesSplit from scikit-learn). Early stopping patience = 50 rounds.
+Experiment tracking: All hyperparameter combinations, metrics, and artifacts (model weights, SHAP plots, confusion matrices) logged to MLflow Tracking Server.
+
+6.3 Model Evaluation Metrics
+
+7. Model Serving & Real-Time Inference
+7.1 Inference Architecture
+The model serving layer must meet a strict <50ms latency SLA for the end-to-end scoring pipeline (feature retrieval + model inference + SHAP computation + score storage). This is achieved through:
+BentoML service for LightGBM: Compiled to ONNX format for 3–5x speedup over native Python inference. Served via FastAPI-based BentoML runner.
+TorchServe for LSTM: PyTorch model exported to TorchScript (.pt format). Served via TorchServe with custom handler that handles sequence padding and attention mask generation.
+Feast online feature retrieval: Redis-backed feature lookup with connection pooling. <5ms P99.
+SHAP computation: LightGBM Tree SHAP (native C++ implementation). Computed in-process alongside inference. <5ms for 47 features.
+Asynchronous score persistence: Score written to Redis synchronously (for immediate dashboard refresh). PostgreSQL write is async (Celery task) to avoid blocking the scoring path.
+
+7.2 BentoML Service Definition
+
+7.3 Inference Latency Breakdown
+
+
+8. Explainability & Fairness Framework
+8.1 SHAP — SHapley Additive Explanations
+SHAP is the mathematical backbone of Sentinel's explainability layer. It is grounded in cooperative game theory: each feature is treated as a player in a coalition game, and its Shapley value represents its fair contribution to the model's prediction, averaged across all possible feature orderings.
+
+
+8.2 SHAP Implementation Strategy
+8.2.1 LightGBM — TreeExplainer (Fast Path)
+Uses TreeExplainer from the shap library — optimized C++ implementation with O(TLD) complexity (T=trees, L=leaves, D=depth).
+Computes exact SHAP values (not approximations) for every tree in the LightGBM ensemble.
+Output: 47-dimensional SHAP value vector per customer, where each value represents the feature's signed contribution to the log-odds of default.
+Performance: < 5ms for 47 features with 1000-tree LightGBM model.
+
+8.2.2 LSTM — DeepExplainer (Temporal Attribution)
+Uses shap.DeepExplainer or shap.GradientExplainer for PyTorch LSTM models.
+Generates temporal SHAP values: attribution matrix of shape (90_days × 12_daily_features), showing which days and which features contributed most to the risk prediction.
+Performance: 50–200ms — computed asynchronously (not on the critical scoring path). Results cached for 24h per customer.
+
+8.2.3 Regulatory Reason Code Mapping
+Raw SHAP feature names must be translated into human-readable, regulatory-compliant adverse action reason codes. The following mapping is maintained as a JSON configuration (version-controlled in Git):
+
+
+8.3 Fairness Monitoring — Adverse Impact Ratio (AIR)
+Sentinel's fairness framework is built around the Adverse Impact Ratio (AIR), which is the standard metric used by the US Equal Credit Opportunity Act (ECOA) and Fair Credit Reporting Act (FCRA), and is directionally applicable to RBI's Fair Practice Code for NBFC/Banks.
+
+
+
+8.4 Population Stability Index (PSI) — Model Drift Detection
+The Population Stability Index (PSI) measures how much the distribution of model input features (or output scores) has shifted between the training period and the current production period. A rising PSI indicates that the model is being asked to score a population it has not seen before — the signal that retraining is required.
+
+
+PSI is computed daily by an Airflow DAG (sentinel_psi_monitor_dag) using Evidently AI's PSI report.
+Monitored for: all 47 input features AND the Pulse Score distribution (output PSI).
+Output PSI > 0.25 triggers an automatic MLflow model retraining pipeline.
+Feature PSI reports are stored in MLflow artifacts and displayed on the Sentinel Ops Dashboard (Grafana).
+
+9. Intervention Engine & Messaging
+9.1 Risk Tiering & Intervention Mapping
+Every customer with an active loan or credit obligation is continuously scored. When a Pulse Score breaches a tier threshold, the Intervention Engine activates the appropriate response workflow.
+
+
+9.2 Message Generation — Template Engine + GenAI
+Sentinel combines structured Jinja2 message templates (for consistency and compliance) with a GenAI layer (optional — open-source LLM via Ollama or OpenAI API) for personalization.
+
+9.2.1 Jinja2 Base Template (Tier 1 — Critical)
+
+9.2.2 GenAI Personalization Layer (Optional — Ollama / Llama 3)
+When Pulse Score confidence interval is narrow (model uncertainty is low), a local LLM (Llama 3 8B via Ollama) generates a personalized variant of the base template.
+System prompt constraints are strictly enforced: no risk language, single sentence, specific tone, CTA required, character limit.
+All GenAI-generated messages are validated against a regex rule engine before dispatch. Any violation falls back to the Jinja2 base template.
+All generated messages are logged with their source (template vs. GenAI) and A/B variant ID for performance analysis.
+
+9.3 Closed-Loop Automation — Customer Response Handling
+When a customer responds 'YES' to an intervention message, the following automated workflow executes within 5 seconds:
+
+Webhook receiver (FastAPI endpoint) captures the 'YES' reply from WhatsApp Business API or SMS gateway.
+Customer identifier resolved from phone number → account mapping in Redis.
+Eligibility check: LMS API queried for current DPD status, existing active deferrals, and deferral count in last 12 months.
+If eligible: LMS API called to patch EMI schedule (defer by 30 days). Status returned.
+If not eligible (e.g., already in DPD, deferral limit exceeded): Alternative offer generated (payment plan, financial counseling referral).
+Confirmation message sent to customer with revised EMI schedule.
+Intervention outcome logged: customer_id, intervention_id, response, eligibility_result, outcome, timestamp → PostgreSQL intervention_outcomes table.
+Feedback event published to Kafka (sentinel.interventions.responses) → triggers model feedback loop in Airflow.
+Pulse Score re-evaluated 24h after intervention; monitoring continues.
+
+
+10. Dashboards & Visualization
+10.1 Dashboard Architecture
+Sentinel's visualization layer uses Plotly Dash for interactive web-based dashboards. Plotly Dash is a Python framework that runs in the browser with React.js components, backed by a Flask server. All data is served via REST API from the Sentinel backend (FastAPI). The dashboard layer reads from:
+PostgreSQL: Historical Pulse Scores, SHAP values, intervention outcomes, customer profiles (via SQLAlchemy ORM)
+Redis: Real-time Pulse Scores, active alert counts (direct Redis client)
+MLflow REST API: Model performance metrics, training run history
+
+10.2 Dashboard Catalog
+10.2.1 Credit Officer Dashboard
+
+10.2.2 Risk Manager Dashboard
+
+10.2.3 Collections Officer Dashboard
+
+10.2.4 Individual Customer Profile Page
+Accessible from Credit Officer Dashboard via customer search or risk-ranked table click.
+Displays: Customer name, account number, contact info, employment status, Pulse Score gauge (color-coded), PD percentage, and risk tier badge.
+Key Financial Metrics: Monthly income, total debt, credit limit, available credit, credit utilization, current spend, days past due, missed payment count.
+Spending Behavioral Drift Chart: 90-day line chart of daily spending with 30-day rolling average baseline overlay. Drift is visually highlighted.
+SHAP Waterfall Chart: Feature-by-feature contribution to the Pulse Score. Green bars = risk-reducing features. Red bars = risk-increasing features. Sorted by absolute SHAP value.
+Audit Trail Tab: All risk score changes, intervention events, and customer responses with timestamps and actor IDs.
+Fairness Metrics Tab: Customer's AIR group membership, model confidence interval, demographic parity score for this customer's segment.
+Quick Actions: 'Send Reminder', 'Initiate Call', 'Offer Payment Holiday' buttons that trigger intervention workflows with one click + confirmation modal.
+
+11. MLOps, DevOps & CI/CD
+11.1 Apache Airflow — DAG Catalog
+Apache Airflow orchestrates all scheduled tasks in Sentinel. Each DAG is version-controlled in Git and deployed via CI/CD. Below is the complete DAG catalog:
+
+
+11.2 MLflow — Model Lifecycle Management
+11.2.1 Experiment Tracking
+Every training run logs: all hyperparameters (via mlflow.log_params), all evaluation metrics (mlflow.log_metrics), model artifacts (LightGBM .txt, LSTM .pt, scaler .pkl), SHAP summary plots, confusion matrices, Precision-Recall curves.
+Runs are tagged with: data_version (hash of training dataset), feature_store_version (Feast registry commit hash), schema_version (Avro schema fingerprint).
+
+11.2.2 Model Registry & Promotion Workflow
+
+11.2.3 Champion/Challenger Framework
+When a new Challenger model passes the Staging gate, it is deployed in shadow mode (scores all customers but does not trigger interventions).
+After 7 days of shadow scoring, a statistical comparison is performed: two-sample KS test on Challenger PD vs. Champion PD distributions; recall@top15% on labeled outcomes (using 7-day delayed label assignment).
+If Challenger shows ≥ 3% KS improvement with p-value < 0.05: promote to production. The transition happens via BentoML's canary deployment — 10% of traffic routes to Challenger for 24h, then 100%.
+
+11.3 CI/CD Pipeline
+
+12. Security, Compliance & Governance
+12.1 Data Security Architecture
+
+12.2 Regulatory Compliance Mapping
+
+12.3 Immutable Audit Log Schema
+
+13. Testing Strategy
+13.1 Testing Pyramid
+
+13.2 Model Card — Documentation Requirements
+Every model promoted to production in Sentinel must have an associated Model Card documented in MLflow artifacts and Git. The Model Card must include:
+Model overview: purpose, version, training date, responsible team, training data date range
+Training data: feature list, label definition, class balance, data sources, temporal split dates
+Performance metrics: KS, AUROC, AUPRC, Recall@Top5%, Recall@Top15%, Brier Score, ECL reduction estimate
+Fairness metrics: AIR by geography, age, gender, income band; PSI at time of training
+Limitations: customer segments with limited training data (new customers < 6 months vintage); known failure modes
+Ethical considerations: features excluded due to discriminatory potential; bias mitigation steps applied
+Validation sign-off: Risk Manager approval, Independent Model Validator sign-off, Compliance Officer review
+Operational requirements: inference latency SLA, retraining trigger conditions, rollback procedure
+
+14. Implementation Roadmap & Phases
+14.1 Phase Overview
+
+14.2 Team Responsibilities
+
+15. Mathematical & Economic Framework
+15.1 Behavioral Drift Scoring
+The behavioral drift score for each feature is computed as a standardized deviation of the recent short-term mean from the historical baseline mean. This is analogous to a z-score in statistics, adapted for time-series financial data.
+
+
+15.2 Expected Credit Loss (ECL) Formula
+
+15.3 Pulse Score Computation
+
+15.4 Population Stability Index (PSI)
+
+15.5 Adverse Impact Ratio (AIR)
+
+16. Infrastructure & Deployment
+16.1 Kubernetes Cluster Architecture
+
+16.2 Service Mesh & Networking
+Service Mesh: Istio (mutual TLS between all pods; traffic management; circuit breaking; retries with exponential backoff; distributed tracing).
+Ingress: Nginx Ingress Controller (external traffic) + Istio Gateway (internal service-to-service).
+DNS: CoreDNS for internal service discovery (services addressable as sentinel-scorer.sentinel.svc.cluster.local).
+Network Policies: Kubernetes NetworkPolicy enforces strict ingress/egress rules — ML scoring service cannot directly access the loan management system; only via the intervention API.
+
+16.3 Observability Stack
+
+16.4 Infrastructure as Code
+All infrastructure is defined as code and version-controlled in Git (GitOps model).
+Kubernetes resources: Helm charts for each service (kafka-chart, flink-chart, sentinel-scorer-chart, sentinel-dash-chart, etc.)
+Helm values per environment: values-dev.yaml, values-staging.yaml, values-prod.yaml
+Secrets: HashiCorp Vault + External Secrets Operator (ESO) — secrets injected into pods at runtime; never stored in Git or container images.
+Argo CD: GitOps continuous deployment — Git commit to main branch triggers automatic Argo CD sync to staging; manual promotion button for production.
+Network / DNS / TLS: cert-manager for automatic TLS certificate provisioning (Let's Encrypt or internal CA).
+
+17. Future Scope & Roadmap
+17.1 Intelligent Adaptive Systems (12–18 months)
+
+17.2 Scalable Infrastructure (18–24 months)
+Edge-based risk scoring: Deploy lightweight quantized LightGBM model (ONNX quantized to INT8) directly to ATM firmware and mobile banking SDK — local Pulse Score computation with sub-millisecond latency, no network round-trip.
+Multi-tenant deployment: Support multiple banks on a single Sentinel platform with complete data isolation (Kubernetes namespaces + Vault namespace isolation + PostgreSQL schema separation).
+Hybrid cloud / on-premise: Support deployment on on-premise Kubernetes (OpenShift) for banks with regulatory requirements against cloud data storage. All Kafka, Redis, PostgreSQL remain on-premises; only ML training optionally uses cloud GPU.
+
+17.3 Autonomous Finance (24–36 months)
+Generative AI 'What-If' Simulations: Allow credit officers to run conversational queries ('What if this customer's salary increased by 20%? How would their Pulse Score change?') using an LLM backed by SHAP counterfactual analysis.
+Agentic AI Financial Restructuring: An LLM-powered agent that proposes and (with human approval) executes complete loan restructuring plans for at-risk customers — adjusting tenure, rate, payment frequency — within policy bounds, with full audit trail.
+Behavioral Archetype Profiling: Cluster customers into dynamic financial personas ('Paycheck-to-Paycheck Salaried', 'Conservative Saver', 'Credit-Dependent Self-Employed') using K-Means / UMAP clustering on behavioral features. Each archetype gets personalized intervention playbooks.
+Conversational Financial Assistant: In-app AI assistant that proactively nudges customers ('Your savings are down 30% this month. Want to set up a micro-savings plan?') using the Pulse Score as the triggering signal and the customer's behavioral archetype as the communication style guide.
+
+17.4 Technology Upgrade Path
+
+Appendix A: Open-Source Technology Stack — Complete Reference
+
+Appendix B: Key Terminology Glossary
+
+
+— End of Sentinel Implementation Plan v1.0 —
+
+Prepared by Team RavenClaw  |  HackOHire 2024  |  Theme 3: Pre-Delinquency Intervention Engine
+
+All rights reserved. This document is confidential and intended for evaluation purposes only.
+PROJECT
+SENTINEL v1.0 | TEAM
+RavenClaw
+THEME
+Theme 3: Pre-Delinquency Intervention Engine | STACK
+100% Open-Source (Kafka, Feast, LightGBM, PyTorch, MLflow)
+MEMBERS
+Devraj Sundrani  |  Sohan Jadyal  |  Tanmay Vishwakarma  |  Sanyogeeta Pradhan  |  Atharv Vedant | COMPLIANCE
+RBI Digital Lending  |  IFRS 9 ECL  |  Basel III  |  GDPR
+
+# | Section | Key Topics | Page Ref
+0 | Table of Contents | Document structure overview | —
+1 | Executive Summary | Problem, goals, quantified impact | 2
+2 | System Architecture Overview | High-level design, data flow, component map | 3
+3 | Data Architecture & Sources | Data catalog, schemas, ingestion contracts | 5
+4 | Streaming & Event-Driven Pipeline | Kafka topics, Flink jobs, partitioning strategy | 7
+5 | Feature Engineering & Feature Store | Feast setup, behavioral features, drift signals | 9
+6 | ML Model Design & Training | LightGBM, LSTM, ensemble, SMOTE, ECL objective | 11
+7 | Model Serving & Real-Time Inference | BentoML, FastAPI, KServe, <50ms SLA | 14
+8 | Explainability & Fairness Framework | SHAP, AIR, PSI, reason codes, audit logs | 16
+9 | Intervention Engine & Messaging | Tiered outreach, GenAI messaging, closed-loop | 18
+10 | Dashboards & Visualization | Credit officer, risk manager, collections dashboards | 20
+11 | MLOps, DevOps & CI/CD | Airflow DAGs, MLflow registry, drift retraining | 22
+12 | Security, Compliance & Governance | Encryption, RBAC, audit trails, regulatory mapping | 25
+13 | Testing Strategy | Unit, integration, model validation, load testing | 27
+14 | Implementation Roadmap & Phases | Phase 0–4, milestones, team assignments | 29
+15 | Mathematical & Economic Framework | ECL formula, PSI, AIR, drift scoring maths | 31
+16 | Infrastructure & Deployment | Docker, Kubernetes, Helm, resource sizing | 33
+17 | Future Scope | Federated learning, Transformer models, agentic AI | 35
+
+ | Market Context — India (2024)
+3% of Indian household debt is currently delinquent. Delinquency rates reach 17.4% in high-risk geographic zones. Indian banks carry a 5% loan loss rate, with provisioning requirements of 20–25% on unsecured substandard assets and 100% provisioning on doubtful unsecured assets (RBI Basel III norms).
+
+Metric | Traditional System | With Sentinel | Improvement
+Detection Timing | After 30+ DPD | 7–10 days before DPD-1 | 9.2 days earlier
+NPL Reduction | Baseline | — | 20–25% reduction
+Collection Cost | 15–20% of recovery | Digital-first outreach | 10–20% lower
+False Positive Rate | High (snapshot models) | 28% reduction post-monitoring | 28% fewer false alerts
+Throughput | Batch (nightly) | Real-time event-driven | 100,000+ QPS capable
+Explainability | None / Black-box | SHAP reason codes per customer | Full XAI compliance
+Regulatory Alignment | Reactive | Proactive + auditable | RBI / IFRS 9 / Basel III
+
+Layer | Name | Responsibility | Key Technologies
+L1 | Data Ingestion & Streaming | Real-time capture of all transaction events across products | Apache Kafka, Apache Flink, PostgreSQL CDC (Debezium)
+L2 | Feature Engineering & Store | Transform raw events into behavioral signals; serve features at <5ms | Feast (Feature Store), Apache Flink, Redis (online), Parquet/PostgreSQL (offline)
+L3 | ML Modeling & Scoring | Train and serve risk models; produce Pulse Score 0–100 | LightGBM, PyTorch LSTM, scikit-learn, MLflow
+L4 | Explainability & Decision | Produce SHAP explanations, reason codes, fairness checks | SHAP library, custom AIR monitor, MLflow artifacts
+L5 | Intervention & Notification | Trigger tiered outreach; close the loop on customer responses | Celery + Redis (task queue), Jinja2 (message templates), REST webhook integration
+L6 | Visualization & Intelligence | Dashboards for credit officers, risk managers, collections teams | Plotly Dash, Grafana, Apache Superset
+L7 | MLOps & Orchestration | Pipeline scheduling, model retraining, drift monitoring, registry | Apache Airflow, MLflow Registry, Evidently AI, Prometheus + Grafana
+
+Step | Action | Component | Latency SLA
+1 | Transaction occurs (salary, EMI, UPI, ATM withdrawal) | Bank Core Banking System / CBS | —
+2 | CDC or API pushes event to Kafka topic | Debezium CDC / REST Producer | < 200ms
+3 | Flink consumer reads event, enriches with customer metadata | Apache Flink Stream Job | < 50ms
+4 | Behavioral features computed (rolling windows, drift scores) | Flink + Feast write to Redis online store | < 100ms
+5 | Feature vector assembled from Feast online store | Feast SDK — online retrieval | < 5ms
+6 | LightGBM model scores structured features | BentoML inference endpoint | < 20ms
+7 | LSTM model scores time-sequence patterns | PyTorch TorchServe endpoint | < 30ms
+8 | Ensemble Pulse Score computed; SHAP values generated | Ensemble layer + SHAP explainer | < 10ms
+9 | Score stored in Redis; historical score logged to PostgreSQL | Redis SET + PostgreSQL INSERT | < 5ms
+10 | If Pulse Score > threshold, intervention event published to Kafka | Kafka Producer (intervention-triggers topic) | < 10ms
+11 | Celery worker picks up intervention task; selects message template | Celery + Jinja2 template engine | < 500ms
+12 | Empathetic message dispatched via channel (SMS / WhatsApp / Email) | Twilio / SendGrid / WhatsApp Business API | < 2s
+13 | Customer response captured; eligibility check and EMI patch executed | REST callback + loan servicing API | < 5s
+14 | Intervention outcome logged; model feedback loop triggered | Airflow + MLflow | Async
+
+ | Total End-to-End Latency (Steps 1–10)
+Transaction to Pulse Score update: < 500ms. From score breach to message dispatch: < 3 seconds. This enables genuinely proactive intervention — not next-day batch processing.
+
+Field Name | Data Type | Source System | Description | Frequency
+customer_id | UUID / VARCHAR(36) | Core Banking System (CBS) | Unique customer identifier | Per event
+account_id | VARCHAR(20) | CBS | Account number | Per event
+transaction_id | UUID | CBS | Unique transaction reference | Per event
+transaction_ts | TIMESTAMP WITH TZ | CBS | Transaction timestamp (UTC) | Per event
+transaction_type | ENUM | CBS | CREDIT / DEBIT / TRANSFER / ATM / UPI / EMI_DEBIT / AUTO_DEBIT | Per event
+amount | DECIMAL(15,2) | CBS | Transaction amount (INR) | Per event
+merchant_category_code | VARCHAR(4) | CBS / Visa/Mastercard | MCC for card transactions | Per event
+channel | ENUM | CBS | BRANCH / ATM / UPI / NEFT / IMPS / NACH / ONLINE | Per event
+status | ENUM | CBS | SUCCESS / FAILED / REVERSED / PENDING | Per event
+counterparty_id | VARCHAR(50) | CBS | Recipient UPI ID / bank account | Per event
+balance_post | DECIMAL(15,2) | CBS | Account balance after transaction | Per event
+product_type | ENUM | CBS | SAVINGS / CURRENT / LOAN / CREDIT_CARD | Per event
+
+Field Name | Data Type | Source | Description | Frequency
+expected_salary_day | INTEGER | HR integration / Account analysis | Day of month salary is expected (1–31) | Monthly
+employer_id | VARCHAR(50) | CBS / NACH mandate | Employer VPA or corporate account ID | On change
+avg_salary_amount_3m | DECIMAL(15,2) | CBS aggregation | 3-month rolling average salary credit | Weekly
+last_salary_credit_ts | TIMESTAMP | CBS | Timestamp of most recent salary credit | Per event
+salary_delay_days | INTEGER | Computed | Actual vs expected salary day delta (computed feature) | Per salary event
+
+Field Name | Data Type | Source | Description | Frequency
+loan_id | VARCHAR(30) | Loan Management System (LMS) | Unique loan account reference | On origination
+emi_amount | DECIMAL(15,2) | LMS | Monthly EMI obligation | On change
+emi_due_date | DATE | LMS | EMI due date | Monthly
+outstanding_principal | DECIMAL(15,2) | LMS | Current outstanding principal (EAD proxy) | Daily
+days_past_due | INTEGER | LMS | Current DPD status | Daily
+loan_type | ENUM | LMS | HOME / PERSONAL / AUTO / EDUCATION / BUSINESS / CREDIT_CARD | On origination
+emi_payment_day_actual | INTEGER | CBS | Actual day EMI payment was made | Per payment event
+failed_auto_debit_count_30d | INTEGER | NACH / NPCI | Count of failed NACH mandates in last 30 days | Daily
+
+Field Name | Data Type | Source | Description | Frequency
+credit_limit | DECIMAL(15,2) | Card Management System | Approved credit card limit | On change
+credit_utilization_pct | DECIMAL(5,2) | Card / CBS | Current utilized % of credit limit | Daily
+min_payment_due | DECIMAL(15,2) | Card | Minimum payment due this cycle | Monthly
+min_payment_made | BOOLEAN | Card | Whether only minimum payment was made | Per payment
+credit_bureau_score | INTEGER | CIBIL / Experian API | Latest credit bureau score | Monthly
+bureau_enquiry_count_90d | INTEGER | CIBIL | Number of hard enquiries in 90 days (stress signal) | Monthly
+upi_lending_app_txns_7d | INTEGER | UPI / CBS | UPI transfers to known lending apps in 7 days | Rolling daily
+
+Field Name | Data Type | Source | Description | Stress Signal
+discretionary_spend_7d | DECIMAL(15,2) | CBS + MCC mapping | Total spend on dining, entertainment, retail in 7 days | DECREASE signals stress
+utility_spend_7d | DECIMAL(15,2) | CBS + MCC mapping | Electricity, gas, internet, mobile recharge in 7 days | DELAY signals stress
+utility_payment_day_avg | FLOAT | CBS aggregation | Average day-of-month utility payments are made | SHIFT LATER signals stress
+atm_withdrawal_amount_7d | DECIMAL(15,2) | CBS | Total ATM cash withdrawals in 7 days | INCREASE signals stress
+atm_withdrawal_count_7d | INTEGER | CBS | Number of ATM withdrawals in 7 days | INCREASE signals stress
+gambling_lottery_spend_7d | DECIMAL(15,2) | CBS + MCC 7995/7993 | Spend on gambling / lottery MCC codes | INCREASE signals stress
+grocery_spend_7d | DECIMAL(15,2) | CBS + MCC 5411/5412 | Grocery spend — defensive spending | INCREASE while others drop
+savings_balance_7d | DECIMAL(15,2) | CBS | Current savings/FD account balance | DECLINE signals stress
+savings_wow_change_pct | FLOAT | CBS | Week-over-week % change in savings balance | NEGATIVE signals stress
+
+ | Avro Schema Contract Example — Transaction Event
+{
+  "type": "record",
+  "name": "TransactionEvent",
+  "namespace": "com.sentinel.events.v1",
+  "fields": [
+    {"name": "customer_id", "type": "string"},
+    {"name": "account_id", "type": "string"},
+    {"name": "transaction_id", "type": "string"},
+    {"name": "transaction_ts", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "transaction_type", "type": {"type": "enum", "name": "TxType", "symbols": ["CREDIT","DEBIT","UPI","ATM","AUTO_DEBIT","EMI_DEBIT"]}},
+    {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 15, "scale": 2}},
+    {"name": "status", "type": {"type": "enum", "name": "TxStatus", "symbols": ["SUCCESS","FAILED","REVERSED","PENDING"]}},
+    {"name": "balance_post", "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 15, "scale": 2}], "default": null}
+  ]
+}
+
+Kafka Topic | Partitions | Replication Factor | Retention | Producers | Consumers | Description
+sentinel.raw.transactions | 32 | 3 | 7 days | CBS, Card Mgmt, LMS, UPI Gateway | Flink Enrichment Job | All raw bank transaction events
+sentinel.enriched.events | 32 | 3 | 3 days | Flink Enrichment Job | Feature Computation Job | Transactions enriched with customer metadata
+sentinel.features.customer | 16 | 3 | 1 day | Feature Computation Job | ML Scoring Service | Assembled feature vectors per customer
+sentinel.scores.pulse | 16 | 3 | 30 days | ML Scoring Service | Intervention Engine, Dashboard sink | Pulse Scores + SHAP values
+sentinel.alerts.high-risk | 8 | 3 | 7 days | Intervention Engine | Notification Workers | High risk (Pulse Score > 75) alerts
+sentinel.alerts.moderate-risk | 8 | 3 | 7 days | Intervention Engine | Notification Workers | Moderate risk (50–75) alerts
+sentinel.interventions.sent | 8 | 3 | 90 days | Notification Workers | Feedback Loop / Airflow | Record of all interventions dispatched
+sentinel.interventions.responses | 8 | 3 | 90 days | Webhook Receiver | Feedback Loop / LMS | Customer responses to interventions
+sentinel.audit.log | 4 | 3 | 365 days | All services | SIEM / Compliance system | Immutable audit event stream
+sentinel.dlq.errors | 4 | 3 | 30 days | All consumers (on error) | Ops team / Alert system | Dead letter queue for failed events
+
+Configuration Parameter | Value | Rationale
+acks | all (acks=-1) | All in-sync replicas must acknowledge — zero data loss guarantee
+min.insync.replicas | 2 | At least 2 replicas must be in sync for producer acknowledgement
+replication.factor | 3 | Tolerates single broker failure without data loss
+compression.type | lz4 | Best throughput/CPU tradeoff for high-volume financial events
+max.message.bytes | 1MB | Sufficient for even the largest enriched event payloads
+log.retention.bytes | -1 (unlimited) | Retention controlled by time (see topic table above)
+auto.create.topics.enable | false | All topics created via Terraform / infrastructure-as-code only
+enable.idempotence | true (producer) | Exactly-once producer semantics — prevents duplicate events
+isolation.level | read_committed (consumer) | Consumers only read fully committed transactions
+Consumer Group ID | sentinel-<service>-cg | Unique consumer group per service for independent offset management
+
+Feast Component | Technology | Role in Sentinel
+Online Store | Redis 7.x (clustered) | Serve features at <5ms for real-time inference. Stores last 7 days of rolling aggregates per customer.
+Offline Store | PostgreSQL 15 + Apache Parquet on MinIO | Store full feature history for model training. Time-travel queries allow point-in-time feature retrieval.
+Feature Registry | PostgreSQL (metadata) + Git | Version-controlled feature definitions. All feature views, entities, and data sources are code-defined.
+Stream Ingestion | Flink writes to Redis via Feast.write_to_online_store() | Real-time feature materialization. Each Flink output triggers an upsert to the online store.
+Batch Materialization | Airflow DAG runs Feast materialize-incremental daily | Syncs offline store with online store for features that need historical backfill.
+Feature Server | FastAPI wrapper over Feast SDK | REST endpoint for feature retrieval: POST /features {entity_rows: [{customer_id: '...'}]}
+
+Feature Name | Computation | Signal Direction | Drift Threshold
+salary_delay_days | (actual_credit_day - expected_salary_day). Positive = late. | Positive = stress | ≥ 3 days
+salary_amount_deviation_pct | (this_month_salary - avg_3m_salary) / avg_3m_salary × 100 | Negative = stress | -15%
+salary_credit_count_90d | Count of salary credits in last 90 days (should be ~3) | < 3 = stress | < 3
+salary_employer_change_flag | Binary: employer account changed in last 60 days | 1 = potential stress | Any change
+salary_partial_credit_flag | Binary: salary credit < 80% of historical average | 1 = stress | < 0.8x avg
+
+Feature Name | Computation | Signal Direction | Drift Threshold
+savings_balance_7d_avg | 7-day rolling average savings balance | Declining = stress | < 60% of 90d avg
+savings_wow_change_pct | (balance_today - balance_7d_ago) / balance_7d_ago × 100 | Negative = stress | < -10% WoW
+savings_mom_change_pct | (balance_today - balance_30d_ago) / balance_30d_ago × 100 | Negative = stress | < -20% MoM
+net_cash_flow_7d | Total credits - Total debits in last 7 days | Negative = stress | < -5,000 INR
+liquidity_buffer_days | savings_balance / (avg_daily_spend_30d). Days of runway. | Declining = stress | < 7 days
+fd_premature_withdrawal_flag | Binary: FD broken before maturity in last 30 days | 1 = stress | Any occurrence
+
+Feature Name | Computation | Signal Direction | Drift Threshold
+credit_utilization_pct | (credit_used / credit_limit) × 100 | Rising = stress | > 70% or +15pp WoW
+utilization_wow_change_pp | utilization_this_week - utilization_last_week (percentage points) | Positive = stress | > 10pp
+min_payment_only_flag | Binary: only minimum payment made this cycle | 1 = stress | Any occurrence
+upi_lending_app_transfer_7d | Sum of UPI credits to known P2P lending apps (Slice, LazyPay, etc.) in 7d | Rising = stress | > 500 INR or 2+ txns
+credit_bureau_score_decline | Latest score - score 90d ago (negative = decline) | Negative = stress | < -20 points
+bureau_enquiry_count_90d | Count of hard credit enquiries in 90 days | Rising = stress | > 3 enquiries
+
+Feature Name | Computation | Signal Direction | Drift Threshold
+failed_auto_debit_count_30d | Count of NACH/ECS failures in 30 days | Rising = stress | > 1 failure
+emi_payment_delay_days_avg | Average days between EMI due date and actual payment date in last 3 cycles | Positive = stress | ≥ 2 days avg
+emi_payment_day_shift | (avg_payment_day_last_3m - avg_payment_day_3m_to_6m). Later = stress. | Positive = stress | ≥ 3 days later
+utility_payment_delay_days | Average day-of-month utilities are paid - historical baseline | Positive = stress | ≥ 4 days later
+utility_payment_count_30d | Count of utility payments in 30d (falling count = inability to pay) | Falling = stress | < 80% of 6m avg
+bounce_charge_amount_30d | Total bounce/penalty charges debited in 30d | Rising = stress | > 0 INR
+
+Feature Name | Computation | Signal Direction | Drift Threshold
+discretionary_spend_7d | Dining (MCC 5812) + Entertainment (MCC 7832) + Apparel (MCC 5621) in 7d | Falling = stress | < 60% of 30d avg
+discretionary_spend_wow_pct | WoW % change in discretionary spend | Negative = stress | < -20% WoW
+grocery_spend_7d | Grocery (MCC 5411, 5412) spend in 7 days | Rising while others fall = stress | Contextual
+atm_withdrawal_amount_7d | Total ATM withdrawal INR in 7 days | Rising = stress | > 150% of 30d avg
+atm_withdrawal_count_7d | ATM withdrawal transactions in 7 days | Rising = stress | > 2x 30d avg
+gambling_spend_7d | MCC 7995 + 7993 transactions in 7d | Rising = stress | Any spend
+online_spending_pct_change | WoW % change in e-commerce/online spend | Negative = stress | < -30% WoW
+food_delivery_spend_7d | Swiggy/Zomato MCC 5812+delivery in 7d | Rising = stress | > 150% of 30d avg
+
+Feature Name | Computation | Signal Direction | Drift Threshold
+total_outstanding_debt | Sum of all loan outstanding principals + credit card used | Rising = stress | YoY > +30%
+debt_to_income_ratio | total_outstanding_debt / (avg_3m_salary × 12) | Rising = stress | > 0.5
+product_count | Number of active loan/card products | High = complex exposure | Contextual
+cross_product_stress_score | Weighted sum of stress signals across all products (0–1) | Rising = stress | > 0.4
+inflow_outflow_ratio_30d | Total credits / Total debits in 30 days | < 1 = stress | < 0.95
+
+Feature Name | Computation | Signal Direction | Notes
+customer_segment | Retail / HNI / SME / Microfinance | Context for threshold calibration | From CRM
+geography_risk_tier | 1 (low) to 4 (high) based on geographic delinquency rates | Higher = more sensitive thresholds | From RBI zonal data
+employment_type | SALARIED / SELF_EMPLOYED / BUSINESS_OWNER / RETIRED | Affects salary signal weight | From KYC/CRM
+customer_vintage_months | Months since account opening | Newer = less baseline data | From CBS
+historical_delinquency_count | Count of past DPD events in customer lifetime | Higher = higher base PD | From LMS history
+emi_to_income_ratio | Total monthly EMI obligations / monthly income | Higher = less buffer | From LMS + income data
+
+ | Why Ensemble?
+LightGBM excels at detecting snapshot-based structured risk signals (e.g., today's credit utilization vs. baseline). LSTM excels at detecting temporal sequence patterns (e.g., the progressive 6-week degradation pattern before a default). Neither alone captures the full risk picture. The ensemble captures both.
+
+Parameter | Value | Rationale
+Algorithm | LightGBM (Gradient Boosted Decision Trees) | Best-in-class for tabular financial data. 6ms inference. Native handling of missing values.
+Objective | binary (binary cross-entropy) | Binary classification: will miss payment in next 14–28 days
+Learning Rate | 0.03 (with early stopping) | Low learning rate with 500–2000 trees; prevents overfitting
+Max Depth | -1 (unlimited, controlled by num_leaves) | leaf-wise tree growth — more efficient than depth-wise
+Num Leaves | 127 (2^7 - 1) | Balances model complexity and generalization
+Min Child Samples | 50 | Prevents learning from very small leaf nodes — improves fairness
+Feature Fraction | 0.8 | 80% of features sampled per tree — reduces overfitting, improves speed
+Bagging Fraction | 0.8 + Bagging Freq: 5 | Row subsampling for regularization
+Class Weight | scale_pos_weight = (non-delinquent count / delinquent count) | Handles severe class imbalance (typically 97:3 or worse)
+Regularization | reg_alpha=0.1 (L1), reg_lambda=0.1 (L2) | Prevents feature over-reliance
+Input Features | All 47 features from Feature Store | Full feature vector for each customer at scoring time
+Output | Probability of Default (PD) ∈ [0, 1] | Logistic output layer with Platt scaling calibration
+SHAP Compatibility | Native Tree SHAP (TreeExplainer) — O(TLD) complexity | SHAP values computed in < 5ms using LightGBM's built-in C++ SHAP
+
+Parameter | Value | Rationale
+Architecture | 3-layer Bidirectional LSTM with attention | Bidirectional reads past and future context; attention highlights key stress moments
+Input Sequence Length | 90 days (daily aggregate vectors) | Captures seasonal patterns and 3-month behavioral baseline
+Input Feature Dimension | 12 (daily aggregated features) | Balance, spending total, payment events, ATM, credit utilization, income (daily)
+Hidden Size | 128 (first LSTM) → 64 (second) → 32 (third) | Gradually compresses temporal representation
+Attention Mechanism | Scaled Dot-Product Attention over LSTM hidden states | Highlights which days contributed most to risk (supports temporal explainability)
+Dropout | 0.3 (after each LSTM layer) | Regularization for sequence models
+Output Layer | Fully connected: 32 → 16 → 1, Sigmoid activation | PD ∈ [0, 1] for temporal risk
+Loss Function | Binary Cross-Entropy with positive class weight | Handles imbalance; consistent with LightGBM objective
+Optimizer | Adam (lr=1e-3, weight_decay=1e-5) | Standard for LSTM training; weight decay adds L2 regularization
+Batch Size | 256 | Balances GPU utilization and gradient stability
+Training Device | CUDA GPU (NVIDIA A100 / V100) or CPU fallback | PyTorch autodetects device; CPU inference < 30ms
+Sequence Padding | Mask padding tokens in loss computation | New customers with < 90 days history are zero-padded with attention masks
+
+Parameter | Value | Rationale
+Meta-Learner Algorithm | Logistic Regression (scikit-learn) | Interpretable, fast, regularized combination of model outputs
+Inputs | LightGBM PD + LSTM PD + 5 hand-crafted risk features (DPD count, emi_to_income_ratio, salary_delay_days, credit_utilization_pct, failed_auto_debit_count_30d) | Combines model outputs with high-signal expert features
+Optimization Objective | Minimize ECL = PD × LGD × EAD — not accuracy or AUC | Aligns model threshold with actual financial loss, not statistical metrics
+Calibration Method | Platt Scaling (logistic calibration) on held-out validation set | Ensures PD outputs are true probabilities, not miscalibrated scores
+Output | Calibrated PD ∈ [0, 1] → Pulse Score = round(PD × 100) | Pulse Score 0–100 for human-interpretable risk communication
+Threshold Selection | Optimized for Recall @ Top 5% and Recall @ Top 15% risk tiers | Captures the most at-risk customers; different thresholds for different intervention tiers
+
+Metric | Formula / Description | Target Value | Why This Metric
+KS Statistic | Max separation between TPR and FPR curves | ≥ 0.45 | Primary ranking metric for credit risk models
+AUROC | Area Under ROC Curve | ≥ 0.82 | Overall discrimination ability
+AUPRC | Area Under Precision-Recall Curve | ≥ 0.45 (hard with imbalanced data) | Better than AUROC for imbalanced classes
+Recall @ Top 5% | True positive rate among top 5% highest-scored customers | ≥ 0.60 | Critical for catching the highest-risk customers
+Recall @ Top 15% | True positive rate among top 15% highest-scored customers | ≥ 0.80 | Operational coverage of intervention budget
+F1 Score (threshold-tuned) | Harmonic mean of precision and recall at optimal threshold | ≥ 0.55 | Balanced evaluation at operational threshold
+Brier Score | Mean squared error of probability predictions | ≤ 0.08 | Calibration quality check
+ECL Reduction | Simulated portfolio loss reduction using model outputs | ≥ 20% vs. baseline | Business-aligned evaluation
+PSI (Population Stability Index) | Distribution shift between training and serving feature distributions | < 0.10 (stable), 0.10–0.25 (watch), > 0.25 (retrain) | Monitors feature drift in production
+
+ | BentoML Service Structure (sentinel_lgbm_service.py)
+import bentoml
+from bentoml.io import NumpyNdarray, JSON
+import shap, numpy as np
+
+lgbm_runner = bentoml.lightgbm.get("sentinel_lgbm:latest").to_runner()
+svc = bentoml.Service("sentinel_lgbm_scorer", runners=[lgbm_runner])
+
+@svc.api(input=JSON(), output=JSON())
+async def score(features: dict) -> dict:
+    feature_array = np.array([list(features.values())], dtype=np.float32)
+    pd_score = await lgbm_runner.predict_proba.async_run(feature_array)
+    
+    # Compute SHAP values using pre-loaded Tree explainer
+    explainer = shap.TreeExplainer(lgbm_runner._model)
+    shap_values = explainer.shap_values(feature_array)[1]
+    
+    top_drivers = sorted(
+        zip(features.keys(), shap_values[0]),
+        key=lambda x: abs(x[1]), reverse=True
+    )[:5]
+    
+    return {
+        "pd": float(pd_score[0][1]),
+        "pulse_score": round(float(pd_score[0][1]) * 100),
+        "top_shap_drivers": [{"feature": f, "shap": float(v)} for f, v in top_drivers],
+        "model_version": "lgbm_v2.1.0"
+    }
+
+Step | Component | P50 Latency | P95 Latency | P99 Latency
+Feature Retrieval | Feast → Redis (connection pooled) | 2ms | 4ms | 6ms
+LightGBM Inference | BentoML + ONNX Runtime | 8ms | 12ms | 18ms
+LSTM Inference | TorchServe + TorchScript | 15ms | 22ms | 28ms
+SHAP Computation | TreeExplainer (C++ native) | 3ms | 5ms | 8ms
+Ensemble Combination | Logistic Regression (numpy) | < 1ms | < 1ms | < 1ms
+Redis Score Write | SET with TTL 24h | 1ms | 2ms | 3ms
+Total End-to-End | Parallel execution where possible | 18ms | 35ms | 48ms
+
+ | Latency SLA Achievement
+P99 latency of 48ms comfortably meets the <50ms SLA. LightGBM and LSTM inference run in parallel (asyncio.gather) since they operate on different feature subsets. Total wall-clock time = max(LightGBM time, LSTM time) + overhead.
+
+ | The SHAP Promise for Banking Compliance
+SHAP satisfies the three regulatory properties required for credit decision explanations: (1) Efficiency — all feature contributions sum to the prediction gap from the baseline. (2) Symmetry — features contributing equally receive equal values. (3) Dummy — features with no effect receive zero contribution. These properties make SHAP a de facto standard for GDPR 'right to explanation' and ECOA/FCRA adverse action notice compliance.
+
+SHAP Feature (Top Driver) | Regulatory Reason Code | Consumer-Facing Message (English) | Consumer-Facing Message (Hindi)
+salary_delay_days | RC-001 — INCOME_IRREGULARITY | Recent delays in income credited to your account | Aapke khate mein aay deri se aa rahi hai
+savings_wow_change_pct | RC-002 — SAVINGS_DECLINE | Declining savings balance trend observed | Bachat khate mein kami dekhi gayi hai
+credit_utilization_pct | RC-003 — HIGH_CREDIT_UTILIZATION | Credit utilization has increased significantly | Credit utilization badh gayi hai
+failed_auto_debit_count_30d | RC-004 — PAYMENT_FAILURES | Recent payment failures on automatic debits | Automatic bhugtan mein galti aayi hai
+upi_lending_app_transfer_7d | RC-005 — INCREASED_BORROWING | Increased transfers to lending applications detected | Udhaar lene mein badhot dekha gaya hai
+utility_payment_delay_days | RC-006 — BILL_PAYMENT_DELAYS | Delays in regular bill payments observed | Billing bhugtan mein deri ho rahi hai
+atm_withdrawal_amount_7d | RC-007 — HIGH_CASH_WITHDRAWAL | Unusual increase in cash withdrawal activity | Nakit nikasi mein asadharan badhot hai
+emi_payment_delay_days_avg | RC-008 — EMI_DELAY_PATTERN | Pattern of delayed EMI payments observed | EMI bhugtan mein deri ka pattern dikha
+
+ | AIR Formula
+AIR = (Favorable outcome rate for protected group) / (Favorable outcome rate for reference group)
+
+Regulatory threshold: AIR ≥ 0.80 (the 4/5ths rule). If AIR < 0.80, it indicates the model has an adverse disparate impact on the protected group.
+
+In Sentinel's context: 'favorable outcome' = NOT being flagged as high-risk. The metric is computed across geographic (rural/urban), age (≤30, 31–50, 51+), and gender segments.
+
+Fairness Dimension | Protected Group | Reference Group | Monitor Frequency | Action If AIR < 0.80
+Geographic | Rural customers | Urban customers | Weekly | Recalibrate geographic_risk_tier feature weights; audit feature set for geographic proxies
+Age | Customers ≤ 30 years | Customers 31–50 years | Weekly | Remove age-correlated features; apply sample reweighting in training
+Gender | Female customers | Male customers | Weekly | Remove gender-correlated features; apply adversarial debiasing training
+Income Band | Bottom 25% income | Median income band | Weekly | Adjust emi_to_income_ratio feature normalization; increase SMOTE weight for low-income class
+
+ | PSI Formula
+PSI = Σ [(Actual_i - Expected_i) × ln(Actual_i / Expected_i)]
+
+where i = each bin of the feature or score distribution.
+
+Interpretation: PSI < 0.10 → Stable (no action). PSI 0.10–0.25 → Moderate shift (investigate). PSI > 0.25 → Significant shift (trigger retraining).
+
+Pulse Score Range | Risk Tier | Label | Intervention Type | Message Tone | Channel Priority | SLA to Contact
+75–100 | Tier 1 | CRITICAL | Payment Holiday offer OR EMI Restructuring + Human callback | Empathetic, Urgent, Offer-led | WhatsApp → SMS → Call | < 1 hour
+55–74 | Tier 2 | HIGH RISK | Flexible EMI offer (reduce by 20–30%) OR Payment date shift | Supportive, Solution-led | WhatsApp → SMS | < 4 hours
+40–54 | Tier 3 | MODERATE | Soft digital nudge + financial wellness tip + helpline number | Caring, Informational | App push → SMS | < 24 hours
+25–39 | Tier 4 | EARLY WATCH | In-app banner + budgeting nudge (no explicit risk mention) | Friendly, Proactive | App push only | Next login
+0–24 | Tier 5 | STABLE | No intervention — continue passive monitoring | — | — | —
+
+ | SMS / WhatsApp Template (Tier 1 — Critical Risk)
+Template ID: SENTINEL_T1_EMI_DEFER_v3
+Channel: WhatsApp + SMS
+Characters: < 140
+
+Template (Jinja2):
+"Hi {{ customer_first_name }}, we noticed {{ top_shap_reason_consumer }}. 
+Need to defer your {{ loan_type }} EMI of ₹{{ emi_amount_formatted }} 
+due {{ emi_due_date_short }}? Reply YES for help. 
+No credit impact. -{{ bank_name }}"
+
+Rendered Example:
+"Hi Rahul, we noticed your salary arrived a bit late this month. 
+Need to defer your Home Loan EMI of ₹18,500 due Dec 5? 
+Reply YES for help. No credit impact. -Sentinel Bank"
+
+Constraints enforced:
+- MUST NOT contain the word "risk", "delinquent", "default", or "overdue"
+- MUST include one clear Call-to-Action (CTA)
+- MUST include "No credit impact" for EMI deferral offers
+- MUST be < 140 characters for SMS fallback
+- MUST use customer's first name (personalization)
+- MUST include bank's opt-out instructions in footer (regulatory)
+
+ | Legal & Compliance Note on Automated Actions
+The automated EMI deferral workflow must be constrained by bank-defined policy parameters: maximum number of deferrals per year (e.g., 2), maximum consecutive deferral months (e.g., 1), eligibility DPD threshold (e.g., DPD = 0 at time of request). These parameters are stored in a configuration service (not hardcoded) to allow policy updates without code deployment.
+
+Widget | Type | Data Source | Refresh Rate | Description
+Portfolio Risk KPIs | 4-card KPI row | PostgreSQL (real-time aggregation) | 30 seconds | Critical Risk count (DPD > 30), At Risk count (high pulse score), Total Portfolio Debt, Avg Credit Utilization
+Portfolio Risk Distribution | Donut Chart (Plotly) | PostgreSQL pulse_scores table | 5 minutes | Customer count by risk tier (Safe / Watch / At Risk / Critical)
+Monthly Spending by Risk Tier | Grouped Bar Chart | PostgreSQL + spending features | Daily | Compare avg spend across Safe / At Risk / Critical segments
+Credit Utilization Range | Box Plot | PostgreSQL feature store snapshot | Daily | Distribution of credit utilization % across portfolio
+Top Intervention Candidates | Ranked Table | Redis + PostgreSQL | 30 seconds | Top 20 customers by Pulse Score with SHAP top driver
+Customer Search & Profile | Search + Detail Drawer | PostgreSQL + Redis | Real-time | Search by name/account; click to open full customer profile with SHAP waterfall chart
+Spending Behavioral Drift Chart | Line Chart (dual-axis) | PostgreSQL feature time-series | Daily | Individual customer: 90-day spending trend vs. baseline
+Intervention Response Funnel | Funnel Chart | PostgreSQL intervention_outcomes | Hourly | Sent → Delivered → Opened → Responded YES → EMI Deferred
+
+Widget | Type | Data Source | Description
+Portfolio Exposure Summary | KPI Cards | LMS + PostgreSQL | Total portfolio debt (EAD), NPL ratio, avg PD, expected loss (ECL)
+Probability of Default by Utilization | Scatter + Regression Line | PostgreSQL | 2D plot: X=credit utilization%, Y=avg PD; shows utilization-risk relationship
+Risk Tier Breakdown (Count & Avg PD) | Grouped Bar Chart | PostgreSQL | Count of customers per risk tier (Green/Yellow/Orange/Red) with avg PD per tier
+Customer Risk Clustering | 2D t-SNE / UMAP Scatter | PostgreSQL feature vectors + sklearn | Interactive cluster visualization colored by risk tier
+ECL Trend (Monthly) | Area Chart | PostgreSQL (monthly aggregation) | Month-over-month ECL trend: actual vs. model forecast
+Geographic Risk Heatmap | Choropleth Map (Plotly) | PostgreSQL + geo data | State/district-level delinquency risk heat map
+Model Performance Monitor | Gauge + Time Series | MLflow REST API | Live KS statistic, AUROC, PSI; model drift alert status
+Detailed Risk Metrics by Tier | Table | PostgreSQL | Risk tier × (Count, Avg PD, % of Portfolio, Avg Debt) matrix
+
+Widget | Type | Description
+Total Overdue Amount | KPI Card | Total INR overdue across all DPD buckets
+Contact Rate (30 days) | KPI Card | % of contacted vs. attempted interventions in last 30 days
+Expected Recovery (30 days) | KPI Card | ML-predicted recovery amount assuming historical conversion rates
+Critical Priority Accounts | KPI Card | Accounts in DPD > 90 requiring immediate escalation
+Accounts by Days Overdue | Stacked Bar Chart | Account count + overdue amount by DPD bucket (1–30, 31–60, 61–90, 90+)
+Callback Attempt Results | Pie Chart | Results of outreach attempts: Payment plan agreed / Promised payment / Unable to contact / No answer
+30-Day Recovery Forecast vs Actual | Dual-Line Chart | ML-forecasted vs. actual recovery trend (weekly, rolling 3 weeks)
+Pre-Delinquency vs Post-Delinquency Recovery Rate | Comparison Bar | Recovery rate from pre-DPD interventions vs. traditional post-DPD collections
+
+DAG ID | Schedule | Description | Key Tasks | SLA
+sentinel_feature_materialize_dag | Daily @2:00 AM | Materializes offline features from Kafka-persisted Parquet to Feast offline store | 1. Run dbt transformations on raw data 2. Feast materialize-incremental 3. Validate feature counts 4. Alert if row count anomaly | < 2 hours
+sentinel_model_retrain_dag | Monthly (or PSI-triggered) | Full model retraining pipeline | 1. Fetch training data (Feast get_historical_features) 2. SMOTE + preprocessing 3. Optuna hyperparameter search 4. Train LightGBM + LSTM 5. Evaluate on hold-out 6. Champion/Challenger comparison 7. MLflow register if improved 8. Canary deploy to BentoML | < 6 hours
+sentinel_psi_monitor_dag | Daily @6:00 AM | Monitors PSI for all 47 features and output score distribution | 1. Fetch production feature distribution (last 7 days) 2. Compare to training distribution 3. Compute PSI per feature 4. Generate Evidently PSI report 5. If PSI > 0.25: trigger retraining DAG 6. Store report in MLflow | < 30 minutes
+sentinel_air_fairness_dag | Weekly @Sunday 8:00 AM | Computes AIR across all protected segments | 1. Fetch last 7 days of Pulse Scores 2. Join with demographic segments 3. Compute AIR per segment 4. Generate fairness report 5. If AIR < 0.80: alert Risk Manager + block model promotion | < 45 minutes
+sentinel_intervention_report_dag | Daily @8:00 AM | Generates daily intervention performance report | 1. Aggregate intervention send/respond/convert metrics 2. Compute channel performance (SMS vs WhatsApp vs App) 3. Calculate pre-DPD recovery rate 4. Publish to Plotly Dash (write to PostgreSQL report tables) | < 15 minutes
+sentinel_model_performance_dag | Weekly | Evaluates current production model against labeled outcomes | 1. Fetch customers scored 30 days ago 2. Join with current DPD status (label) 3. Compute KS, AUROC, recall@top15% 4. Store in MLflow 5. Alert if KS < 0.40 | < 1 hour
+sentinel_data_quality_dag | Daily @1:00 AM | Validates incoming data quality using Great Expectations | 1. Run GE checkpoints on raw transaction data 2. Check for null rates, distribution anomalies, schema compliance 3. Block feature materialization if critical expectations fail 4. Publish data quality report | < 30 minutes
+
+Stage | Description | Promotion Criteria | Who Approves
+None / Experimental | Fresh training run — not yet evaluated | Automatic after training completes | —
+Staging | Candidate model for production | KS ≥ 0.45, AUROC ≥ 0.82, AIR ≥ 0.80 for all segments, PSI < 0.10 | Automated gate (Airflow task)
+Production (Champion) | Live production model serving all customers | Champion/Challenger A/B test shows Challenger ≥ 3% KS improvement | Risk Manager + Model Validator sign-off (HITL)
+Archived | Previous production model retained for audit | Automatic on new Champion promotion | Automatic
+
+Stage | Tool | Trigger | Actions
+Code Lint & Format | Black, isort, flake8 | Git push to any branch | Auto-format code; fail if linting errors
+Unit Tests | pytest (100% coverage for scoring logic) | Git push | Run all unit tests; fail PR if < 90% coverage
+Integration Tests | pytest + Docker Compose | PR to main branch | Spin up local Kafka, Redis, PostgreSQL; test full event-to-score pipeline end-to-end
+Schema Validation | Avro schema compatibility check (Confluent Schema Registry API) | PR to main branch | Ensure new schema versions are backward-compatible
+Model Quality Gate | Automated Airflow DAG run | PR to main branch (for model changes) | Re-evaluate model on hold-out test set; fail if metrics below threshold
+Container Build | Docker BuildKit (multi-stage) | Merge to main branch | Build service containers: sentinel-scorer, sentinel-flink-jobs, sentinel-dashboard, sentinel-airflow
+Security Scan | Trivy (container CVE scan) + Bandit (Python security lint) | Merge to main branch | Fail deployment if critical CVEs found
+Deploy to Staging | Helm upgrade (Kubernetes) | Merge to main branch | Rolling deploy to staging namespace; smoke tests run
+Deploy to Production | Helm upgrade with canary (Argo Rollouts) | Manual approval after staging validation | 10% canary → 50% → 100% with automated rollback on error rate spike
+
+Security Domain | Control | Implementation | Standard
+Encryption at Rest | AES-256 encryption for all stored data | PostgreSQL TDE (Transparent Data Encryption); Redis AOF files encrypted via dm-crypt; Parquet files in MinIO encrypted with SSE-S3 | NIST FIPS 140-2
+Encryption in Transit | TLS 1.3 for all inter-service communication | Kafka TLS + mTLS; Redis TLS; All REST APIs behind TLS-terminating Nginx; gRPC with TLS for Flink | RBI IT Framework 2021
+PII Tokenization | Customer PII replaced with tokens in feature store | customer_id is a UUID token; name, phone, email stored only in PII vault (HashiCorp Vault); feature store and model never see raw PII | GDPR Article 25 (Privacy by Design)
+Key Management | Hardware Security Module (HSM) or Vault-backed key management | HashiCorp Vault for secrets (DB passwords, API keys, encryption keys); Key rotation every 90 days; Vault audit log enabled | PCI DSS Requirement 3
+Network Segmentation | Kubernetes NetworkPolicy to isolate services | Kafka brokers in separate VLAN/namespace; Database in private subnet with no internet access; Scoring API in DMZ with WAF | CIS Kubernetes Benchmark
+Access Control | Role-Based Access Control (RBAC) | Kubernetes RBAC; PostgreSQL row-level security; Feast RBAC for feature access; Separate service accounts per microservice | Principle of Least Privilege
+
+Regulation | Requirement | Sentinel Implementation | Evidence Artifact
+RBI Digital Lending Guidelines (2022) | Automated credit decisions must be explainable; customer must be informed of data used | SHAP reason codes generated per customer; Privacy notice includes feature list; Opt-out workflow implemented | SHAP report in MLflow; Privacy notice template in Git
+IFRS 9 ECL (Expected Credit Loss) | Banks must provision for expected credit losses using forward-looking information | ECL = PD × LGD × EAD computed daily per customer; Results feed provisioning system | Daily ECL report in PostgreSQL; Airflow DAG logs in MLflow
+Basel III — Credit Risk | Probability of Default (PD) models must be validated and documented | LightGBM PD model with documented training methodology; Annual backtesting via model_performance_dag; Independent validation report | MLflow model card; Validation report in Git
+GDPR — Right to Explanation | Data subjects have the right to meaningful information about automated decisions | SHAP reason codes in human-readable format; Customer-facing explanation available on request via bank app | Reason code mapping table (JSON in Git); API endpoint /customer/{id}/explanation
+ECOA / FCRA (applicable for India via analogy) | Adverse action notices must include principal reasons | Top-3 SHAP drivers mapped to regulatory reason codes; RC codes stored per scoring event | RC codes in intervention_audit table; Annual AIR report
+RBI IT Risk Framework | Immutable audit logs; Change management for ML models | Kafka sentinel.audit.log topic with WORM (Write-Once-Read-Many) semantics; MLflow model registry with stage transitions requiring approvals | Audit log archive in MinIO; MLflow transition history
+
+ | Audit Log Event Schema (PostgreSQL + Kafka)
+Table: sentinel_audit_log
+Columns:
+  audit_id        UUID PRIMARY KEY DEFAULT gen_random_uuid()
+  event_ts        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+  event_type      VARCHAR(50) NOT NULL  -- SCORE_GENERATED | INTERVENTION_SENT | MODEL_PROMOTED | FEATURE_ACCESSED | CONFIG_CHANGED
+  actor_id        VARCHAR(100) NOT NULL  -- service account or user ID
+  customer_id     UUID  -- NULL for non-customer events
+  resource_id     VARCHAR(100)  -- score_id, intervention_id, model_version_id
+  action_detail   JSONB NOT NULL  -- full event payload
+  ip_address      INET
+  session_id      UUID
+  checksum        VARCHAR(64)  -- SHA-256 of (event_ts || actor_id || customer_id || action_detail)
+
+Constraints:
+  - NO DELETE privilege granted to any service account
+  - NO UPDATE privilege on any column
+  - Partitioned by month for query performance
+  - Monthly partitions archived to MinIO (immutable object storage) after 6 months
+  - Retention: 7 years (RBI regulatory requirement)
+
+Test Level | Scope | Tool | Coverage Target | Frequency
+Unit Tests | Individual functions: feature computation, SHAP mapping, risk tier assignment, message template rendering | pytest + hypothesis (property-based testing) | ≥ 95% line coverage for scoring logic | Every commit
+Integration Tests | End-to-end event flow: Kafka → Flink → Feast → Scorer → Redis → Intervention trigger | pytest + Docker Compose (local Kafka/Redis/PostgreSQL) | All critical paths covered | Every PR
+Contract Tests | Kafka Avro schema compatibility; Feast feature API contract; BentoML API contract | Pact (consumer-driven contract tests) + Confluent Schema Registry API | 100% of inter-service contracts | Every PR
+Model Validation Tests | Evaluate trained model against held-out test set; regression test vs. previous champion | pytest + scikit-learn metrics + custom ECL evaluator | KS ≥ 0.45, AUROC ≥ 0.82, PSI < 0.10 | Every training run
+Performance / Load Tests | Scoring service throughput; feature retrieval latency; Kafka consumer lag | Locust (HTTP load testing) + kafka-python consumer lag monitor | 100K QPS, P99 < 50ms, zero consumer lag at 32 partitions | Weekly (staging environment)
+Chaos Engineering | Broker failure, network partition, Redis restart, Flink task slot failure | Chaos Monkey for Kubernetes (kube-monkey) + manual fault injection | All critical paths gracefully degrade; no data loss | Monthly
+Security Penetration Tests | API endpoint security, authentication bypass, SQL injection, PII exposure | OWASP ZAP + Burp Suite + manual pen test | Zero critical / high severity findings | Quarterly
+Fairness / Bias Tests | AIR across all demographic segments; SHAP stability across customer groups | Custom pytest fixtures + aif360 library | AIR ≥ 0.80 for all segments; SHAP top-3 stability across 10 bootstrap samples ≥ 0.85 | Every training run
+
+Phase | Name | Duration | Key Deliverables | Success Criteria
+Phase 0 | Foundation & Infrastructure | 4 weeks | Kubernetes cluster setup, Kafka cluster (3 brokers), PostgreSQL, Redis, MinIO, MLflow server, Airflow, Confluent Schema Registry, CI/CD pipeline | All infrastructure deployed and passing smoke tests; CI/CD green
+Phase 1 | Data Pipeline & Feature Store | 6 weeks | Avro schema definitions, Flink enrichment job, Feast feature store (online + offline), 47 features registered and serving, Debezium CDC connectors | Feature freshness < 5 min; P99 feature retrieval < 5ms; Data quality checks passing
+Phase 2 | ML Modeling & Scoring Engine | 8 weeks | LightGBM model trained (KS ≥ 0.45), LSTM model trained, Meta-learner ensemble, BentoML scoring service, TorchServe LSTM endpoint, SHAP integration | P99 scoring latency < 50ms; AUROC ≥ 0.82; All customers scored within 24h of first transaction
+Phase 3 | Intervention & Messaging | 4 weeks | Intervention Engine (Celery), message templates (all 4 tiers), WhatsApp Business API integration, SMS gateway (Twilio), closed-loop response handler, LMS deferral API integration | Intervention dispatch < 1 hour from Pulse Score breach; Response handler processing < 5 seconds; Zero PII in logs
+Phase 4 | Dashboards & Explainability | 4 weeks | Plotly Dash — all 3 role-based dashboards, SHAP waterfall chart per customer, audit trail UI, fairness metrics dashboard, Grafana ops dashboard | Dashboard load < 3 seconds; SHAP reason codes displayed for 100% of scored customers; Audit log queryable
+Phase 5 | MLOps & Monitoring | 3 weeks | All Airflow DAGs deployed, PSI monitoring live, AIR fairness monitoring live, Champion/Challenger framework, model retraining pipeline | PSI alert within 24h of drift; AIR computed weekly; Retraining pipeline tested end-to-end
+Phase 6 | Security Hardening & Compliance | 3 weeks | RBAC implemented, TLS everywhere, PII tokenization, Vault secrets, penetration test remediation, regulatory compliance documentation | Zero critical security findings; Model Card completed; Audit log immutability verified
+Phase 7 | Pilot & Production Launch | 4 weeks | Pilot with 10,000 customer cohort, shadow mode validation, Champion/Challenger comparison, regulatory submission, full production rollout | KS ≥ 0.45 in production; 0 critical incidents in first 30 days; NPL reduction measurable in 90-day pilot
+
+Team Member | Role | Primary Ownership in Sentinel
+Devraj Sundrani | ML Lead / System Architect | Overall system architecture; ML model design (LightGBM + LSTM); Meta-learner ensemble; MLflow lifecycle; Phase 2 lead
+Sohan Jadyal | Data Engineer / Kafka Lead | Kafka topic design; Flink stream processing jobs (all 3); Debezium CDC; Schema registry; Phase 1 lead
+Tanmay Vishwakarma | Backend / MLOps Engineer | BentoML scoring service; TorchServe deployment; Airflow DAG development; CI/CD pipeline; Phase 5 lead
+Sanyogeeta Pradhan | Explainability & Compliance Lead | SHAP integration; Reason code mapping; AIR/PSI fairness framework; Regulatory documentation; Model Card; Phase 6 lead
+Atharv Vedant | Frontend / Dashboard Lead | Plotly Dash dashboards (all 3 roles); Intervention Engine UI; Customer profile page; SHAP waterfall visualization; Phase 4 lead
+
+ | Drift Score Formula
+For feature f, at time T:
+
+μ_short(f,T) = (1/k) × Σ[t=T-k to T] f_t          (Rolling short-term mean, k=7 days)
+
+μ_hist(f,T)  = (1/m) × Σ[t=T-m to T-k] f_t         (Historical baseline mean, m=90 days)
+
+σ_hist(f,T)  = std deviation of f over historical window (T-m to T-k)
+
+Drift_f(T)   = (μ_short(f,T) - μ_hist(f,T)) / σ_hist(f,T)
+
+Early Stress Flag: |Drift_f(T)| > θ_f
+where θ_f is the per-feature drift threshold (see Feature Catalog, Section 5.2)
+
+Composite Drift Score = Σ_f [ w_f × |Drift_f(T)| × sign_f ]
+where w_f = SHAP-derived feature importance (updated weekly)
+and sign_f = +1 if drift direction is 'stress-positive', -1 otherwise
+
+ | IFRS 9 ECL Formula
+ECL = PD × LGD × EAD × DF
+
+Where:
+  PD  = Probability of Default (output of Sentinel's LightGBM meta-learner, calibrated)
+  LGD = Loss Given Default (bank-specific, e.g., 40% for unsecured personal loans, 20% for secured home loans)
+  EAD = Exposure At Default (outstanding principal + undrawn committed credit lines)
+  DF  = Discount Factor (risk-free rate discounting for lifetime ECL; typically 1 for 12-month ECL Stage 1)
+
+Risk Prioritization for Intervention:
+  Priority_i = PD_i × EAD_i    (Note: LGD omitted — all same product type in same tier)
+  High exposure + high risk → first in intervention queue
+
+Model threshold is selected to minimize portfolio-level ECL, not to maximize AUC or accuracy.
+Threshold selection: argmin_θ [ Σ_i ECL_i | scored_high_risk(i) = 1 ]
+
+ | Pulse Score Derivation
+Step 1: LightGBM produces PD_lgbm ∈ [0, 1]
+Step 2: LSTM produces PD_lstm ∈ [0, 1]
+Step 3: Meta-learner (Logistic Regression + Platt Scaling):
+        PD_final = σ(w1 × logit(PD_lgbm) + w2 × logit(PD_lstm) + w3 × x_salary_delay + w4 × x_emi_to_income + ...)
+        where logit(p) = ln(p / (1-p)) and σ(z) = 1 / (1 + e^(-z))
+Step 4: Pulse Score = round(PD_final × 100)  → integer in [0, 100]
+
+Risk Tier Assignment:
+  Pulse Score ≥ 75  → Tier 1 (CRITICAL)   → Immediate intervention
+  Pulse Score 55–74 → Tier 2 (HIGH RISK)  → EMI flexibility offer
+  Pulse Score 40–54 → Tier 3 (MODERATE)  → Digital nudge
+  Pulse Score 25–39 → Tier 4 (WATCH)     → In-app alert
+  Pulse Score 0–24  → Tier 5 (STABLE)    → Passive monitoring
+
+ | PSI Formula
+PSI = Σ_i=1_to_N [ (Actual_i - Expected_i) × ln(Actual_i / Expected_i) ]
+
+Where:
+  N = number of bins (typically 10 equal-frequency bins from training distribution)
+  Actual_i = fraction of production data in bin i
+  Expected_i = fraction of training data in bin i
+
+Interpretation:
+  PSI < 0.10   → No significant change (model stable)
+  0.10 ≤ PSI < 0.25 → Moderate change (investigate; consider retraining)
+  PSI ≥ 0.25   → Significant change → Automatic retraining trigger
+
+Implementation: Evidently AI PSIReport + custom Airflow operator
+
+ | AIR Formula
+AIR = Rate_protected / Rate_reference
+
+Where Rate = P(Favorable outcome | group)
+In Sentinel: Favorable outcome = Pulse Score < 75 (NOT flagged as high-risk)
+
+AIR = P(Pulse < 75 | protected_group) / P(Pulse < 75 | reference_group)
+
+Regulatory threshold: AIR ≥ 0.80 (the 4/5ths rule from EEOC Uniform Guidelines)
+
+Example:
+  If 70% of urban customers have Pulse < 75 (not flagged),
+  and 55% of rural customers have Pulse < 75 (not flagged),
+  AIR = 55% / 70% = 0.786 → BELOW THRESHOLD → bias review required
+
+Node Pool | Node Count | CPU / Memory | Purpose | Auto-scale
+kafka-brokers | 3 (fixed) | 8 vCPU / 32GB RAM each | Apache Kafka broker nodes — data plane | No (fixed for stability)
+flink-jobmanager | 2 | 4 vCPU / 16GB RAM | Flink JobManager (HA pair — leader election via ZooKeeper) | No
+flink-taskmanagers | 4–16 (auto) | 8 vCPU / 32GB RAM | Flink TaskManager nodes (stream processing workloads) | Yes (HPA on Kafka lag)
+ml-scoring | 2–8 (auto) | 4 vCPU / 8GB RAM | BentoML + TorchServe scoring pods | Yes (HPA on request rate, target P99 < 40ms)
+ml-gpu-training | 0–2 (on demand) | 8 vCPU / 64GB RAM / 1x NVIDIA A100 or T4 | Model training and hyperparameter search (Optuna) | Yes (Karpenter, spin up on Airflow trigger)
+airflow-workers | 2–6 (auto) | 4 vCPU / 8GB RAM | Airflow Celery workers for DAG task execution | Yes (KEDA on Airflow task queue depth)
+redis-cluster | 3 (fixed) | 4 vCPU / 16GB RAM | Redis Cluster for feature online store + Celery broker | No (fixed for latency stability)
+postgres-ha | 3 (fixed) | 4 vCPU / 16GB RAM | PostgreSQL HA (Patroni: 1 primary, 2 replicas) | No (fixed for data safety)
+dash-api | 2–4 (auto) | 2 vCPU / 4GB RAM | Plotly Dash + FastAPI dashboard backend | Yes (HPA on HTTP RPS)
+
+Component | Tool | What It Monitors
+Metrics | Prometheus + Grafana | JVM metrics (Kafka/Flink), Kubernetes pod metrics, BentoML request rate/latency/error rate, Redis hit rate, Airflow DAG success rate, model inference latency histogram
+Distributed Tracing | Jaeger (OpenTelemetry instrumentation) | End-to-end trace from Kafka ingestion → Flink processing → Feast retrieval → BentoML inference → Redis write. Identifies latency bottlenecks.
+Log Aggregation | Loki + Grafana (or ELK stack) | Structured JSON logs from all services; log levels (DEBUG/INFO/WARN/ERROR); correlation with trace IDs
+Alerting | Prometheus AlertManager + PagerDuty | P99 latency > 45ms, Consumer lag > 10,000 messages, Airflow DAG failure, PSI > 0.25, AIR < 0.80, Kafka broker down
+Model Monitoring | Evidently AI + MLflow | PSI reports, data drift reports, model performance metrics (KS, AUROC); automatic retraining trigger
+Kafka Monitoring | Kafka UI (open-source) + JMX Exporter | Topic lag per consumer group, broker disk usage, partition leader distribution, message throughput
+
+Enhancement | Description | Technical Approach
+Transformer-Based Behavioral Modeling | Replace LSTM with a Temporal Fusion Transformer (TFT) or Time-Series Transformer (TST) architecture for richer temporal pattern detection | HuggingFace Transformers library; pre-train on 3+ years of transaction history; fine-tune per customer segment
+Real-Time Adaptive Learning | Eliminate model drift by updating model parameters in real-time as new labeled outcomes arrive | River (Python online ML library) for incremental LightGBM updates; concept drift detectors (ADWIN, Page-Hinkley) for automatic adaptation triggers
+Federated Learning | Train models across multiple bank branches or partner NBFCs without sharing raw customer data | PySyft (OpenMined) for federated averaging; differential privacy via Google's TF Privacy; shared model updates only (not data)
+Causal Inference Layer | Move from correlation-based risk detection to causal attribution — understand why a customer is stressed, not just that they are | DoWhy library (Microsoft) for causal graph modeling; instrumental variables for confounded features like region and income
+
+Current (v1.0) | Next (v2.0 — 12 months) | Future (v3.0 — 24 months)
+Apache Kafka 3.x (ZooKeeper) | Apache Kafka KRaft (no ZooKeeper, simplified ops) | Apache Pulsar (multi-tenancy, geo-replication native)
+Apache Flink 1.17 | Apache Flink 2.x (unified batch/stream API) | Apache Flink + Iceberg (open table format for ACID stream-to-lake)
+LightGBM + LSTM Ensemble | Temporal Fusion Transformer (PyTorch) | Foundation model for financial behavior (pre-trained, fine-tuned per bank)
+Feast Feature Store | Feast 0.37+ with push-based streaming features | Hopsworks Feature Platform (managed, enterprise SLA)
+BentoML + TorchServe | KServe (Kubernetes-native, multi-framework) | Triton Inference Server (NVIDIA, multi-model, GPU batching)
+Plotly Dash | Apache Superset (richer BI + no-code charts) | Embedded analytics SDK (white-labeled in bank's own app)
+Evidently AI (drift) | Nannyml (extended drift + performance estimation) | WhyLabs (MLOps observability platform, enterprise)
+
+Category | Technology | Version | Purpose | License
+Message Broker | Apache Kafka | 3.6.x | Real-time event streaming backbone | Apache 2.0
+Schema Registry | Confluent Schema Registry (OSS) | 7.5.x | Avro schema management and versioning | Apache 2.0
+Stream Processing | Apache Flink | 1.17.x | Stateful stream processing for feature computation | Apache 2.0
+Feature Store | Feast | 0.37.x | Feature management, serving, and training-serving consistency | Apache 2.0
+Online Store | Redis | 7.x (Cluster mode) | Sub-millisecond feature retrieval for real-time inference | BSD 3-Clause
+Offline Store | PostgreSQL | 15.x | Historical feature storage; audit logs; intervention records | PostgreSQL License
+Object Storage | MinIO | Latest | Parquet files, model artifacts, audit log archives | AGPL 3.0 / Commercial
+ML — Gradient Boosting | LightGBM | 4.x | Structured feature risk classification; fast inference | MIT
+ML — Deep Learning | PyTorch | 2.x | LSTM temporal sequence modeling | BSD 3-Clause
+ML — Classical | scikit-learn | 1.3.x | Meta-learner ensemble; SMOTE (imbalanced-learn); preprocessing | BSD 3-Clause
+Explainability | SHAP | 0.44.x | Feature attribution for LightGBM (TreeExplainer) and LSTM (DeepExplainer) | MIT
+Model Serving | BentoML | 1.2.x | LightGBM serving with FastAPI backend; ONNX runtime integration | Apache 2.0
+Model Serving | TorchServe | 0.9.x | PyTorch LSTM model serving; multi-model support | Apache 2.0
+Inference Runtime | ONNX Runtime | 1.16.x | Accelerated LightGBM inference (3–5x speedup over Python) | MIT
+Experiment Tracking | MLflow | 2.9.x | Training run tracking, artifact storage, model registry | Apache 2.0
+Orchestration | Apache Airflow | 2.8.x | DAG scheduling for training, monitoring, reporting pipelines | Apache 2.0
+Data Quality | Great Expectations | 0.18.x | Data contract validation and data quality checks | Apache 2.0
+Drift Monitoring | Evidently AI | 0.4.x | PSI reports, data drift, model performance monitoring | Apache 2.0
+Task Queue | Celery | 5.3.x | Asynchronous intervention task processing | BSD 3-Clause
+Dashboard | Plotly Dash | 2.14.x | Interactive web-based analytics dashboards (Python-first) | MIT
+Monitoring | Prometheus | 2.48.x | Metrics collection and alerting | Apache 2.0
+Visualization (Ops) | Grafana | 10.x | Ops dashboard for latency, throughput, model metrics | AGPL 3.0
+Tracing | Jaeger | 1.52.x | Distributed end-to-end request tracing | Apache 2.0
+CDC Connector | Debezium | 2.5.x | Change Data Capture from PostgreSQL/Oracle CBS | Apache 2.0
+Secrets Management | HashiCorp Vault | 1.15.x | Secrets, encryption keys, dynamic credentials | MPL 2.0
+Container Orchestration | Kubernetes | 1.28.x | Container orchestration and scaling | Apache 2.0
+Service Mesh | Istio | 1.20.x | mTLS, traffic management, circuit breaking, tracing | Apache 2.0
+GitOps | Argo CD | 2.9.x | Continuous deployment from Git to Kubernetes | Apache 2.0
+Security Scan | Trivy | Latest | Container image CVE scanning | Apache 2.0
+Hyperparameter Tuning | Optuna | 3.5.x | Bayesian hyperparameter optimization (TPE sampler) | MIT
+Imbalance Handling | imbalanced-learn | 0.11.x | SMOTE and Tomek Links for class imbalance | MIT
+API Framework | FastAPI | 0.104.x | High-performance async REST APIs for all services | MIT
+Message Templates | Jinja2 | 3.1.x | Template rendering for intervention messages | BSD 3-Clause
+
+Term | Definition
+AIR (Adverse Impact Ratio) | Ratio of favorable outcome rates between a protected group and a reference group. Regulatory threshold ≥ 0.80 (4/5ths rule). Used to detect model bias.
+AUC / AUROC | Area Under the Receiver Operating Characteristic Curve. Measures discrimination ability of a binary classifier. Range [0.5, 1.0]; higher is better.
+AUPRC | Area Under the Precision-Recall Curve. More informative than AUROC for imbalanced datasets (like delinquency detection).
+Behavioral Drift | A statistically significant deviation of a customer's recent behavioral pattern from their own historical baseline. The core signal that Sentinel detects.
+Brier Score | Mean squared error of probabilistic predictions. Measures calibration. Range [0, 1]; lower is better. Brier = 0 means perfect calibration.
+CDC (Change Data Capture) | Technology (Debezium) that captures row-level database changes and streams them to Kafka in real-time.
+ECL (Expected Credit Loss) | IFRS 9 formula: PD × LGD × EAD. The probability-weighted estimate of credit losses. Banks must provision this amount.
+EAD (Exposure at Default) | The amount outstanding that could be lost if a customer defaults. Typically the outstanding principal plus undrawn committed lines.
+Feast | Open-source Feature Store. Manages feature definitions, computes features, serves them at low latency, and ensures training-serving consistency.
+Flink CEP | Apache Flink Complex Event Processing. A library for detecting patterns of events in data streams (e.g., salary not received within expected window).
+HITL (Human-in-the-Loop) | A system design where automated model outputs are reviewed by a human before consequential actions. Required for high-stakes AI decisions.
+KS Statistic | Kolmogorov-Smirnov statistic. Measures the maximum separation between the true positive rate and false positive rate curves. Primary credit model metric.
+LGD (Loss Given Default) | The fraction of EAD that would be lost if a customer defaults. Varies by product: typically 40% for unsecured, 20% for secured.
+LightGBM | Light Gradient Boosting Machine. An efficient gradient boosted decision tree framework optimized for tabular data. Best-in-class for structured financial risk scoring.
+LSTM | Long Short-Term Memory. A type of Recurrent Neural Network (RNN) that can learn from sequential time-series data. Used in Sentinel for temporal pattern detection.
+MLflow | Open-source platform for ML experiment tracking, model versioning, registry, and deployment.
+ONNX | Open Neural Network Exchange. A framework-agnostic ML model format. Converting LightGBM to ONNX enables 3–5x faster inference via ONNX Runtime.
+PD (Probability of Default) | The model's estimate of the probability that a customer will miss a payment within the 14–28 day prediction horizon. Core Sentinel output.
+PSI (Population Stability Index) | Measures distributional shift between training data and production data. PSI > 0.25 triggers automatic model retraining.
+Pulse Score | Sentinel's branded customer risk score: PD × 100, rounded to integer [0–100]. 0 = stable, 100 = maximum risk.
+SHAP | SHapley Additive Explanations. A game-theory-based method that computes each feature's contribution to a model's prediction. Gold standard for ML explainability.
+SMOTE | Synthetic Minority Oversampling Technique. Generates synthetic examples of the minority class (delinquent customers) to address extreme class imbalance in training data.
+Training-Serving Skew | A critical ML failure mode where features are computed differently in training vs. production, causing models to underperform. Feast prevents this by enforcing a single feature computation pipeline.
+Waterfall Chart (SHAP) | A visualization showing each feature's contribution to the Pulse Score, displayed as a waterfall from the base value to the final prediction. Used in the Customer Profile dashboard.
+

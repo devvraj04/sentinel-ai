@@ -216,10 +216,14 @@ class BehavioralSignalEngine:
         ]
         return int(len(failed))
  
-    def _credit_utilization_delta(self, df_short: pd.DataFrame, df_hist: pd.DataFrame) -> float:
+    def _credit_utilization_delta(
+        self, df_short: pd.DataFrame, df_hist: pd.DataFrame,
+        credit_limit: float = 0.0,
+    ) -> float:
         """
         Change in credit card utilization.
         Positive = utilization rising (stress signal).
+        Uses actual customer credit_limit (not hardcoded).
         """
         cc_debits_now = df_short[df_short["account_type"] == "credit_card"]["amount"].sum()
         if df_hist.empty:
@@ -227,9 +231,9 @@ class BehavioralSignalEngine:
         cc_hist = df_hist[df_hist["account_type"] == "credit_card"]["amount"].sum()
         cc_hist_avg = cc_hist / (self.HIST_WINDOW_DAYS / self.SHORT_WINDOW_DAYS)
         delta = cc_debits_now - cc_hist_avg
-        # Normalize to a rough utilization delta (assuming ₹100k credit limit)
-        assumed_limit = 100_000
-        return float(np.clip(delta / assumed_limit, -1.0, 1.0))
+        # Use actual credit limit; fall back to historical average * 3 if unknown
+        effective_limit = credit_limit if credit_limit > 0 else max(cc_hist_avg * 3, 50_000)
+        return float(np.clip(delta / effective_limit, -1.0, 1.0))
  
     def _compute_drift(
         self,

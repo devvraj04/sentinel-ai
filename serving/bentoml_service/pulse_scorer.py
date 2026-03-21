@@ -440,15 +440,21 @@ class PulseScorer:
         feature_cols = self._model_package["feature_cols"]
         version      = self._model_package.get("version", "unknown")
 
-        features["month_offset"] = 0.0
+        # No month_offset hack — features are used as-is from Redis
         fv = np.array([features.get(col, 0.0) for col in feature_cols], dtype=float)
 
         pd_prob     = float(model.predict_proba(fv.reshape(1, -1))[0, 1])
         pulse_score = pd_to_pulse_score(pd_prob)
         risk_tier   = pulse_score_to_tier(pulse_score)
         recommended, intervention_type = get_intervention(risk_tier)
-        confidence  = float(abs(pd_prob - 0.5) * 2)
         top_factors = self._compute_shap(fv, feature_cols)
+
+        # SHAP-based confidence: total signal strength
+        if top_factors:
+            total_shap = sum(f["contribution"] for f in top_factors)
+            confidence = float(min(total_shap / max(len(feature_cols) * 0.1, 1), 1.0))
+        else:
+            confidence = float(abs(pd_prob - 0.5) * 2)  # fallback
 
         logger.info("Customer scored (local)",
                     customer_id=customer_id,
@@ -562,9 +568,8 @@ class SageMakerScorer:
         return None
 
     def score(self, customer_id: str, force_refresh: bool = False) -> dict:
-        # Get features from Redis
+        # Get features from Redis — no synthetic features injected
         features = _get_features_from_redis(self._redis, customer_id) or {}
-        features["month_offset"] = 0.0
 
         try:
             # Call SageMaker endpoint

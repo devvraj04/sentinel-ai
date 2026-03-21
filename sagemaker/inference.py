@@ -1,33 +1,28 @@
 """
-scripts/simulate_transactions.py
+sagemaker/inference.py
 ──────────────────────────────────────────────────────────────────────────────
-Sentinel Transaction Simulator — infinite random-user mode.
+Sentinel Transaction Simulator — infinite random-user mode (Indian Context).
 
 DESIGN:
-  - 100 customers, each starting with pulse_score = 0.
-  - Runs an infinite loop: each iteration picks a RANDOM customer (uniform,
-    no bias) and generates ONE transaction for them.
-  - Every transaction is published to Kafka → consumed by feature_pipeline
-    → features written to Redis → LightGBM scores → DynamoDB + PostgreSQL.
-  - Score is updated by the model after EVERY transaction (positive, negative,
-    or zero delta — all are shown).
-  - Press Ctrl+C at any time to stop; a ranked summary is printed.
-
-DATE CONFIGURATION:
-  Real-time mode always uses datetime.now(timezone.utc) — no capping.
-  To change the historical cutoff (used only for timestamp labels):
-  Edit the line marked ← EDIT HERE.
+  - 100 customers with realistic Indian banking profiles.
+  - Each customer has: occupation, employer, salary, loans, credit cards,
+    savings balance, EMI obligations — all in Indian context.
+  - Runs an infinite loop: picks a RANDOM customer, generates ONE transaction
+    with balance_before/after (never negative), proper counterparty
+    (Swiggy, BESCOM, Slice, etc.), and platform (UPI/NEFT/NACH/ATM/etc.).
+  - Every transaction → Kafka → feature_pipeline → Redis → LightGBM → score.
+  - Press Ctrl+C to stop; ranked summary printed.
 
 HOW TO RUN:
   # Terminal 1 — Kafka + infra
   docker-compose up -d
 
-  # Terminal 2 — Feature pipeline consumer (keep running)
+  # Terminal 2 — Feature pipeline consumer
   python -m ingestion.consumers.feature_pipeline
 
   # Terminal 3 — This simulator
-  python -m scripts.simulate_transactions
-  python -m scripts.simulate_transactions --customers 100 --delay 200
+  python -m sagemaker.inference
+  python -m sagemaker.inference --customers 100 --delay 200
 ──────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -64,12 +59,92 @@ fake     = Faker("en_IN")
 settings = get_settings()
 
 IST = timezone(timedelta(hours=5, minutes=30))
-CUTOFF_LABEL = datetime(2026, 3, 20, 23, 59, 59, tzinfo=IST)  # ← EDIT HERE (display only)
 
-GEOGRAPHIES = ["Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad",
-               "Pune", "Kolkata", "Ahmedabad", "Jaipur", "Surat"]
-SEGMENTS    = ["mass_retail", "mass_retail", "mass_retail", "affluent", "hni"]
-CHANNELS    = ["mobile_app", "net_banking", "branch", "atm"]
+# ── Indian context constants ──────────────────────────────────────────────────
+METRO_CITIES = ["Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad", "Pune", "Kolkata"]
+TIER2_CITIES = ["Ahmedabad", "Jaipur", "Surat", "Lucknow", "Nagpur", "Indore",
+                "Bhopal", "Chandigarh", "Coimbatore", "Kochi", "Visakhapatnam"]
+TIER3_CITIES = ["Patna", "Ranchi", "Dehradun", "Guwahati", "Varanasi",
+                "Jodhpur", "Udaipur", "Madurai", "Mangalore", "Mysuru"]
+ALL_CITIES   = METRO_CITIES + TIER2_CITIES + TIER3_CITIES
+
+SEGMENTS  = ["mass_retail", "mass_retail", "mass_retail", "affluent", "hni"]
+CHANNELS  = ["UPI", "NetBanking", "Branch", "ATM"]
+
+# Occupation → (salary_min, salary_max, employment_status)
+OCCUPATIONS = {
+    "IT Professional":       (40_000, 200_000, "salaried"),
+    "Government Employee":   (30_000, 120_000, "salaried"),
+    "Doctor":                (80_000, 500_000, "salaried"),
+    "Teacher":               (20_000, 60_000,  "salaried"),
+    "Bank Employee":         (35_000, 150_000, "salaried"),
+    "Chartered Accountant":  (50_000, 300_000, "self_employed"),
+    "Small Business Owner":  (25_000, 300_000, "self_employed"),
+    "Shopkeeper":            (15_000, 80_000,  "self_employed"),
+    "Freelancer":            (15_000, 80_000,  "gig"),
+    "Retired":               (15_000, 50_000,  "salaried"),  # pension
+    "Farmer":                (10_000, 40_000,  "self_employed"),
+    "Lawyer":                (40_000, 200_000, "self_employed"),
+}
+
+# Employer names by occupation for salary counterparty
+EMPLOYER_NAMES = {
+    "IT Professional":     ["TCS_PAYROLL", "INFOSYS_HR", "WIPRO_SALARY", "HCL_SALARY",
+                            "COGNIZANT_PAY", "TECH_MAHINDRA", "CAPGEMINI_PAY", "ACCENTURE_PAY"],
+    "Government Employee": ["GOV_SALARY", "STATE_GOV_PAY", "CENTRAL_GOV_TREASURY",
+                            "DEFENCE_SALARY", "RAILWAYS_PAY"],
+    "Doctor":              ["APOLLO_HOSPITALS", "FORTIS_HR", "AIIMS_SALARY", "MAX_HEALTHCARE"],
+    "Teacher":             ["CBSE_SCHOOL_PAY", "UNIVERSITY_SALARY", "IIT_SALARY", "KV_SALARY"],
+    "Bank Employee":       ["HDFC_BANK_HR", "SBI_SALARY", "ICICI_BANK_HR", "AXIS_BANK_PAY"],
+    "Retired":             ["PENSION_FUND", "EPFO_PENSION", "NPS_PAYOUT"],
+    "Chartered Accountant":["CA_FIRM_PAY", "DELOITTE_PAY", "EY_SALARY", "KPMG_PAY"],
+}
+
+# Loan profiles: (loan_type, principal_range, tenure_years, interest_rate)
+LOAN_PROFILES = [
+    ("HOME",       (25_00_000, 80_00_000), 20, 8.5),
+    ("PERSONAL",   (1_00_000,  10_00_000),  3, 14.0),
+    ("AUTO",       (5_00_000,  15_00_000),  5, 9.0),
+    ("EDUCATION",  (5_00_000,  20_00_000),  7, 10.0),
+    ("BUSINESS",   (2_00_000,  50_00_000),  5, 12.0),
+]
+
+# Indian counterparty databases
+DINING_COUNTERPARTIES = [
+    ("swiggy@upi",    "Swiggy"),     ("zomato@upi",     "Zomato"),
+    ("dominos@upi",   "Dominos"),    ("mcdonalds@upi",  "McDonalds"),
+    ("kfc@upi",       "KFC"),        ("starbucks@upi",  "Starbucks"),
+    ("ccd@upi",       "Cafe Coffee Day"), ("haldirams@upi", "Haldirams"),
+]
+GROCERY_COUNTERPARTIES = [
+    ("bigbasket@upi", "BigBasket"),   ("dmart@upi",       "DMart"),
+    ("blinkit@upi",   "Blinkit"),     ("zepto@upi",       "Zepto"),
+    ("jiomart@upi",   "JioMart"),     ("reliance@upi",    "Reliance Fresh"),
+]
+SHOPPING_COUNTERPARTIES = [
+    ("amazon@upi",    "Amazon"),      ("flipkart@upi",    "Flipkart"),
+    ("myntra@upi",    "Myntra"),      ("ajio@upi",        "AJIO"),
+    ("croma@upi",     "Croma"),       ("reliance_digital@upi", "Reliance Digital"),
+]
+UTILITY_COUNTERPARTIES = [
+    ("bescom@bbps",       "BESCOM"),          ("bsnl@bbps",     "BSNL"),
+    ("jio_recharge@upi", "Jio Recharge"),    ("airtel@bbps",   "Airtel Postpaid"),
+    ("tata_power@bbps",  "Tata Power"),      ("mahanagar_gas@bbps", "Mahanagar Gas"),
+    ("vi_postpaid@bbps", "Vi Postpaid"),     ("act_fibernet@bbps", "ACT Fibernet"),
+]
+LENDING_COUNTERPARTIES = [
+    ("slice@upi",      "Slice"),        ("lazypay@upi",     "LazyPay"),
+    ("kreditbee@upi", "KreditBee"),    ("moneyview@upi",   "MoneyView"),
+    ("navi@upi",       "Navi"),         ("fibe@upi",        "Fibe"),
+    ("mpokket@upi",    "mPokket"),      ("cashe@upi",       "CASHe"),
+]
+EMI_COUNTERPARTIES = [
+    ("HDFC_HOME_LOAN",       "HDFC Home Loan EMI"),
+    ("SBI_CAR_LOAN",         "SBI Car Loan EMI"),
+    ("BAJAJ_PERSONAL_LOAN",  "Bajaj Personal Loan EMI"),
+    ("AXIS_EDUCATION_LOAN",  "Axis Education Loan EMI"),
+    ("ICICI_BUSINESS_LOAN",  "ICICI Business Loan EMI"),
+]
 
 
 # ── Connections ────────────────────────────────────────────────────────────
@@ -88,10 +163,11 @@ def get_dynamodb():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CUSTOMER PROFILES
+# CUSTOMER PROFILES — Indian Banking Context
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_risk(profile: dict) -> tuple[str, float]:
+    """Compute risk level from customer financial profile."""
     income  = profile["monthly_income"]
     emi     = profile["emi_amount"]
     savings = profile["avg_savings_balance"]
@@ -109,35 +185,111 @@ def compute_risk(profile: dict) -> tuple[str, float]:
     return "healthy", raw
 
 
+def _generate_pan() -> str:
+    """Generate masked Indian PAN (e.g., ABCDE****F)."""
+    letters = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ', k=5))
+    last = random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    return f"{letters}****{last}"
+
+
 def make_customer(idx: int) -> dict[str, Any]:
-    ir = {"low":(12_000,35_000), "mid":(35_000,90_000),
-          "high":(90_000,200_000), "very_high":(200_000,500_000)}
-    bracket = random.choices(list(ir), weights=[35,40,18,7])[0]
-    income  = random.randint(*ir[bracket])
-    emp     = random.choices(["salaried","self_employed","gig"], weights=[60,30,10])[0]
-    emi_r   = random.choices([0.10,0.25,0.40,0.55,0.65], weights=[20,30,25,15,10])[0]
-    emi     = income * emi_r * random.uniform(0.9, 1.1)
-    sav_m   = random.choices([0.3,1.0,2.5,5.0,10.0], weights=[15,30,30,18,7])[0]
+    """
+    Create a customer with realistic Indian banking profile.
+    Includes: occupation, employer, loan details, credit card, savings,
+    PAN, tenure — all in proper Indian context.
+    """
+    # Pick occupation (drives income, employment status)
+    occupation = random.choices(
+        list(OCCUPATIONS.keys()),
+        weights=[18, 12, 5, 8, 8, 4, 15, 10, 8, 5, 4, 3],
+    )[0]
+    sal_min, sal_max, emp = OCCUPATIONS[occupation]
+    income = random.randint(sal_min, sal_max)
+
+    # Geography — metro-weighted
+    geography = random.choices(
+        ["metro", "tier2", "tier3"], weights=[55, 30, 15]
+    )[0]
+    if geography == "metro":
+        city = random.choice(METRO_CITIES)
+    elif geography == "tier2":
+        city = random.choice(TIER2_CITIES)
+    else:
+        city = random.choice(TIER3_CITIES)
+
+    # Loan — 70% of customers have at least one loan
+    has_loan = random.random() < 0.70
+    if has_loan:
+        # Weight loan type by occupation
+        if occupation in ("IT Professional", "Doctor", "Bank Employee", "Lawyer"):
+            loan_wt = [40, 20, 20, 5, 15]  # more home loans
+        elif occupation in ("Small Business Owner", "Shopkeeper", "Farmer"):
+            loan_wt = [10, 25, 10, 5, 50]  # more business loans
+        else:
+            loan_wt = [25, 30, 20, 15, 10]
+        loan_idx = random.choices(range(len(LOAN_PROFILES)), weights=loan_wt)[0]
+        lt, (p_min, p_max), tenure_yr, rate = LOAN_PROFILES[loan_idx]
+        loan_principal = random.randint(p_min, p_max)
+        loan_type = lt
+        # EMI = P * r * (1+r)^n / ((1+r)^n - 1)
+        r = rate / 100 / 12
+        n = tenure_yr * 12
+        emi = loan_principal * r * (1+r)**n / ((1+r)**n - 1)
+    else:
+        loan_principal = 0
+        loan_type = "NONE"
+        emi = 0.0
+
+    # Credit card — 65% of customers
+    has_card = random.random() < 0.65
+    credit_limit = income * random.uniform(1.5, 5.0) if has_card else 0.0
+    credit_used  = credit_limit * random.uniform(0.05, 0.6) if has_card else 0.0
+
+    # Savings balance
+    sav_m   = random.choices([0.3, 1.0, 2.5, 5.0, 10.0], weights=[15, 30, 30, 18, 7])[0]
     savings = income * sav_m * random.uniform(0.8, 1.2)
 
+    # Tenure (months since account opening)
+    tenure = random.choices(
+        [6, 12, 24, 48, 72, 120, 180],
+        weights=[5, 10, 20, 25, 20, 15, 5],
+    )[0] + random.randint(0, 11)
+
+    # Employer name for salary counterparty
+    employer_list = EMPLOYER_NAMES.get(occupation, [f"{occupation.upper().replace(' ', '_')}_PAY"])
+    employer = random.choice(employer_list)
+
+    segment = random.choice(SEGMENTS)
+    product_mix = "both" if has_loan and has_card else ("loan_only" if has_loan else "card_only" if has_card else "none")
+
     profile = {
-        "customer_id":         f"CUST{idx:05d}",
-        "full_name":           fake.name(),
-        "email":               fake.email(),
-        "phone":               fake.phone_number()[:20],
-        "monthly_income":      income,
-        "salary_day":          random.randint(1, 7),
-        "emi_amount":          emi,
-        "emi_due_day":         random.randint(5, 12),
-        "avg_savings_balance": savings,
-        "credit_limit":        income * random.uniform(1.5, 5.0),
-        "segment":             random.choice(SEGMENTS),
-        "geography":           random.choice(GEOGRAPHIES),
-        "employment_status":   emp,
-        "preferred_channel":   random.choice(CHANNELS),
-        "product_mix":         random.choices(["loan_only","card_only","both"], weights=[25,20,55])[0],
-        "has_life_shock":      random.random() < 0.15,
-        "salary_irregularity": random.uniform(0,1) if emp != "salaried" else random.uniform(0,0.2),
+        "customer_id":           f"CUST{idx:05d}",
+        "full_name":             fake.name(),
+        "email":                 fake.email(),
+        "phone":                 fake.phone_number()[:20],
+        "pan_masked":            _generate_pan(),
+        "occupation":            occupation,
+        "employer_name":         employer,
+        "employment_status":     emp,
+        "monthly_income":        income,
+        "salary_day":            random.randint(1, 7),
+        "expected_salary_day":   random.randint(1, 7),
+        "emi_amount":            round(emi, 2),
+        "emi_due_day":           random.randint(5, 12),
+        "total_loan_amount":     loan_principal,
+        "loan_type":             loan_type,
+        "credit_limit":          round(credit_limit, 2),
+        "credit_used":           round(credit_used, 2),
+        "savings_balance":       round(savings, 2),
+        "current_account_balance": round(savings * 0.3, 2) if emp == "self_employed" else 0.0,
+        "avg_savings_balance":   round(savings, 2),
+        "tenure_months":         tenure,
+        "segment":               segment,
+        "geography":             city,
+        "preferred_channel":     random.choice(CHANNELS),
+        "product_mix":           product_mix,
+        "has_life_shock":        random.random() < 0.15,
+        "salary_irregularity":   random.uniform(0, 1) if emp != "salaried" else random.uniform(0, 0.2),
     }
     profile["risk_level"], profile["stress_base"] = compute_risk(profile)
     return profile
@@ -147,8 +299,9 @@ def build_customers(n: int = 100) -> list[dict[str, Any]]:
     random.seed(42)
     customers = [make_customer(i) for i in range(1, n+1)]
     random.seed()
-    counts = {"healthy":0, "at_risk":0, "high_risk":0}
-    for c in customers: counts[c["risk_level"]] += 1
+    counts = {"healthy": 0, "at_risk": 0, "high_risk": 0}
+    for c in customers:
+        counts[c["risk_level"]] += 1
     print(f"  Customers: Healthy={counts['healthy']:,}  "
           f"At-Risk={counts['at_risk']:,}  High-Risk={counts['high_risk']:,}")
     return customers
@@ -303,14 +456,34 @@ def build_feature_vector(customer: dict, df: pd.DataFrame,
     fv["composite_drift_score"] = float(np.mean([abs(fv[f"drift_{k}"])
         for k in ["salary","balance","lending","atm","auto_debit"]]))
 
-    fv["p2p_transfer_spike"]        = 1.0
-    fv["investment_redemption_pct"] = 0.0
-    fv["credit_enquiries_3m"]       = 0.0
-    fv["tenure_months"]             = 24.0
+    # P2P transfer spike — computed from actual P2P UPI transfers
+    p2p_cols = ["is_p2p_transfer"] if "is_p2p_transfer" in df.columns else []
+    if p2p_cols and not df_short.empty:
+        p2p_s = df_short[df_short.get("is_p2p_transfer", pd.Series(dtype=bool)) == True]["amount"].sum() if "is_p2p_transfer" in df_short.columns else 0.0
+        p2p_h = df_hist[df_hist.get("is_p2p_transfer", pd.Series(dtype=bool)) == True]["amount"].sum() if not df_hist.empty and "is_p2p_transfer" in df_hist.columns else 0.0
+        p2p_avg = p2p_h / (76/14) if p2p_h > 0 else 0.0
+        fv["p2p_transfer_spike"] = float(np.clip(p2p_s / max(p2p_avg, income * 0.02, 1), 0.5, 10.0))
+    else:
+        fv["p2p_transfer_spike"] = 1.0 if df_short.empty else float(np.clip(
+            len(df_short[df_short["txn_type"]=="upi_debit"]) / max(len(df_short) * 0.3, 1), 0.5, 5.0))
+
+    # Investment redemption % — from investment/FD withdrawal transactions
+    if "is_investment_txn" in df.columns and not df_90.empty:
+        inv_txns = df_90[df_90.get("is_investment_txn", pd.Series(dtype=bool)) == True] if "is_investment_txn" in df_90.columns else pd.DataFrame()
+        fv["investment_redemption_pct"] = float(inv_txns["amount"].sum() / max(customer["avg_savings_balance"], 1)) if not inv_txns.empty else 0.0
+    else:
+        fv["investment_redemption_pct"] = 0.0
+
+    # Credit enquiries proxy — approximated from failed auto-debits pattern
+    fv["credit_enquiries_3m"] = float(min(len(fd90), 5))  # failed auto-debits as proxy
+
+    # Tenure from customer profile (not hardcoded)
+    fv["tenure_months"] = float(customer.get("tenure_months", 24))
+
     fv["is_salaried"]      = 1.0 if emp == "salaried"       else 0.0
     fv["is_self_employed"] = 1.0 if emp == "self_employed"  else 0.0
-    fv["is_mass_retail"]   = 1.0 if segment == "mass_retail"else 0.0
-    fv["is_affluent"]      = 1.0 if segment in ("affluent","hni") else 0.0
+    fv["is_mass_retail"]   = 1.0 if segment == "mass_retail" else 0.0
+    fv["is_affluent"]      = 1.0 if segment in ("affluent", "hni") else 0.0
     return fv
 
 
@@ -385,7 +558,8 @@ def score_customer(customer: dict, db_conn, dynamo_db,
     pulse_score = pd_to_pulse_score(pd_prob)
     risk_tier   = pulse_score_to_tier(pulse_score)
     recommended, iv_type = get_intervention(risk_tier)
-    confidence  = float(abs(pd_prob - 0.5) * 2)
+    # SHAP-based confidence: signal strength from feature contributions
+    confidence  = 0.0  # will be updated below if SHAP is available
 
     # SHAP
     top_factors = []
@@ -401,8 +575,11 @@ def score_customer(customer: dict, db_conn, dynamo_db,
                         "raw_value":round(float(fv[i]),4)}
                        for i,col in enumerate(feature_cols) if abs(vals[i])>0.001]
             top_factors = sorted(factors, key=lambda x: x["contribution"], reverse=True)[:7]
+            # SHAP-based confidence: normalized signal strength
+            total_shap = sum(abs(float(vals[i])) for i in range(len(vals)))
+            confidence = float(min(total_shap / max(len(feature_cols) * 0.1, 1), 1.0))
         except Exception:
-            pass
+            confidence = float(abs(pd_prob - 0.5) * 2)  # fallback
 
     scored_at = ref.isoformat()
     result = {
@@ -490,27 +667,58 @@ def _write_history(result: dict, db_conn) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ensure_customer_postgres(customer: dict, conn) -> None:
+    """Insert or update customer in PostgreSQL with full Indian profile."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO customers
                 (customer_id, full_name, email, phone, segment,
-                 geography, employment_status, monthly_income)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (customer_id) DO NOTHING
-        """, (customer["customer_id"], customer["full_name"],
-              customer["email"], customer["phone"], customer["segment"],
-              customer["geography"], customer["employment_status"],
-              customer["monthly_income"]))
+                 geography, employment_status, monthly_income,
+                 occupation, employer_name, pan_masked,
+                 expected_salary_day, emi_amount, emi_due_day,
+                 credit_limit, total_loan_amount, loan_type,
+                 savings_balance, current_account_balance,
+                 avg_savings_balance, tenure_months,
+                 preferred_channel, product_mix)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (customer_id) DO UPDATE SET
+                savings_balance = EXCLUDED.savings_balance,
+                current_account_balance = EXCLUDED.current_account_balance,
+                updated_at = NOW()
+        """, (
+            customer["customer_id"], customer["full_name"],
+            customer["email"], customer["phone"], customer["segment"],
+            customer["geography"], customer["employment_status"],
+            customer["monthly_income"],
+            customer.get("occupation", "Unknown"),
+            customer.get("employer_name", ""),
+            customer.get("pan_masked", ""),
+            customer.get("expected_salary_day", 1),
+            customer.get("emi_amount", 0),
+            customer.get("emi_due_day", 5),
+            customer.get("credit_limit", 0),
+            customer.get("total_loan_amount", 0),
+            customer.get("loan_type", "NONE"),
+            customer.get("savings_balance", 0),
+            customer.get("current_account_balance", 0),
+            customer.get("avg_savings_balance", 0),
+            customer.get("tenure_months", 0),
+            customer.get("preferred_channel", "UPI"),
+            customer.get("product_mix", "both"),
+        ))
     conn.commit()
 
 
 def insert_transaction(evt: TransactionEvent, conn) -> None:
+    """Insert transaction with full balance tracking and counterparty info."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO transactions
                 (customer_id, account_id, txn_type, amount,
-                 merchant_category, payment_channel, payment_status, txn_timestamp)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                 merchant_category, payment_channel, payment_status,
+                 txn_timestamp, balance_before, balance_after,
+                 counterparty_id, counterparty_name,
+                 reference_number, platform, account_type)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT DO NOTHING
         """, (
             evt.customer_id,
@@ -521,24 +729,40 @@ def insert_transaction(evt: TransactionEvent, conn) -> None:
             evt.payment_channel,
             evt.payment_status.value if hasattr(evt.payment_status,"value") else str(evt.payment_status),
             evt.txn_timestamp,
+            getattr(evt, "balance_before", None),
+            getattr(evt, "balance_after", None),
+            getattr(evt, "counterparty_id", None),
+            getattr(evt, "counterparty_name", None),
+            getattr(evt, "reference_number", None),
+            getattr(evt, "platform", "unknown"),
+            evt.account_type.value if hasattr(evt.account_type, "value") else str(evt.account_type),
         ))
     conn.commit()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRANSACTION TYPES — weighted by customer stress level
+# TRANSACTION GENERATION — Indian Context, Balance Tracking
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _gen_utr() -> str:
+    """Generate a realistic UTR/reference number."""
+    return f"UTR{random.randint(100000000000, 999999999999)}"
+
 
 def next_transaction(customer: dict, seq: int, now: datetime) -> TransactionEvent:
     """
-    Generate the next transaction for a customer.
-    seq = global transaction number (0-based) — used only for variety, not order.
+    Generate the next transaction for a customer with:
+    - balance_before / balance_after (never negative for savings)
+    - Realistic Indian counterparty (Swiggy, BESCOM, Slice, etc.)
+    - Platform (UPI/NEFT/NACH/ATM/BBPS/POS)
+    - Reference number (UTR)
     """
     cid    = customer["customer_id"]
     income = customer["monthly_income"]
     emi    = customer["emi_amount"]
     stress = customer["stress_base"]
-    credit = customer["credit_limit"]
+    credit = customer.get("credit_limit", 0)
+    savings_bal = customer.get("savings_balance", income * 2)
 
     weights = {
         "salary_credit":     8,
@@ -552,119 +776,293 @@ def next_transaction(customer: dict, seq: int, now: datetime) -> TransactionEven
         "savings_drain":     max(1, int(12 * stress)),
         "lending_app":       max(1, int(15 * stress)),
         "utility_fail":      max(1, int(8  * stress)),
-        "credit_card_spend": 8,
+        "credit_card_spend": 8 if credit > 0 else 0,
+        "p2p_transfer":      6,
     }
 
     kind = random.choices(list(weights), weights=list(weights.values()))[0]
-    fail_prob = min(0.9, customer.get("stress_base", 0) * 0.8 +
-                    (0.2 if customer.get("has_life_shock") else 0))
+    fail_prob = min(0.9, stress * 0.8 + (0.2 if customer.get("has_life_shock") else 0))
+
+    # Helper: compute balance tracking for debit transactions
+    def _debit(amt: float) -> tuple[float, float]:
+        """Returns (balance_before, balance_after). Clamps to enforce non-negative."""
+        bal_before = round(savings_bal, 2)
+        debit_amt = min(amt, savings_bal * 0.95)  # never drain fully
+        bal_after = round(max(0, bal_before - debit_amt), 2)
+        customer["savings_balance"] = bal_after  # update live balance
+        return bal_before, bal_after
+
+    # Helper: compute balance tracking for credit transactions
+    def _credit(amt: float) -> tuple[float, float]:
+        bal_before = round(savings_bal, 2)
+        bal_after = round(bal_before + amt, 2)
+        customer["savings_balance"] = bal_after
+        return bal_before, bal_after
 
     if kind == "salary_credit":
         delay = random.randint(0, max(0, int(8*stress))) if stress > 0.2 else 0
+        sal_amt = round(income * random.uniform(0.88, 1.03) * (1-0.12*stress))
+        b_before, b_after = _credit(sal_amt)
+        employer = customer.get("employer_name", "SALARY_ACC")
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.SALARY_CREDIT,
-            amount=round(income * random.uniform(0.88, 1.03) * (1-0.12*stress)),
+            amount=sal_amt,
             merchant_category=MerchantCategory.OTHER,
             payment_channel="NEFT",
+            platform="NEFT",
+            counterparty_id=employer,
+            counterparty_name=f"{employer} Salary",
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
             txn_timestamp=now - timedelta(days=delay),
         )
+
     elif kind == "utility_payment":
+        cp = random.choice(UTILITY_COUNTERPARTIES)
+        amt = round(random.uniform(300, 5000), 2)
+        b_before, b_after = _debit(amt)
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.UTILITY_PAYMENT,
-            amount=round(random.uniform(300, 5000), 2),
+            amount=amt,
             merchant_category=MerchantCategory.UTILITIES,
-            payment_channel="UPI",
+            payment_channel="BBPS",
+            platform="BBPS",
+            counterparty_id=cp[0],
+            counterparty_name=cp[1],
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
             payment_status=PaymentStatus.SUCCESS,
             txn_timestamp=now,
         )
+
     elif kind == "auto_debit":
         failed = random.random() < fail_prob
+        emi_cp = random.choice(EMI_COUNTERPARTIES)
+        b_before = round(savings_bal, 2)
+        if not failed:
+            b_before, b_after = _debit(round(emi))
+        else:
+            b_after = b_before  # failed: no balance change
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.LOAN,
             txn_type=TransactionType.AUTO_DEBIT,
             amount=round(emi),
-            payment_channel="ECS",
+            payment_channel="NACH",
+            platform="NACH",
+            counterparty_id=emi_cp[0],
+            counterparty_name=emi_cp[1],
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
             payment_status=PaymentStatus.FAILED if failed else PaymentStatus.SUCCESS,
             txn_timestamp=now,
             is_auto_debit_failed=failed,
         )
+
     elif kind == "upi_dining":
+        cp = random.choice(DINING_COUNTERPARTIES)
+        amt = round(random.uniform(80, income*0.04), 2)
+        b_before, b_after = _debit(amt)
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.UPI_DEBIT,
-            amount=round(random.uniform(80, income*0.04), 2),
+            amount=amt,
             merchant_category=MerchantCategory.DINING,
-            payment_channel="UPI", txn_timestamp=now,
+            payment_channel="UPI",
+            platform="UPI",
+            counterparty_id=cp[0],
+            counterparty_name=cp[1],
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
+            txn_timestamp=now,
         )
+
     elif kind == "upi_groceries":
+        cp = random.choice(GROCERY_COUNTERPARTIES)
+        amt = round(random.uniform(200, income*0.05), 2)
+        b_before, b_after = _debit(amt)
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.UPI_DEBIT,
-            amount=round(random.uniform(200, income*0.05), 2),
+            amount=amt,
             merchant_category=MerchantCategory.GROCERIES,
-            payment_channel="UPI", txn_timestamp=now,
+            payment_channel="UPI",
+            platform="UPI",
+            counterparty_id=cp[0],
+            counterparty_name=cp[1],
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
+            txn_timestamp=now,
         )
+
     elif kind == "upi_shopping":
+        cp = random.choice(SHOPPING_COUNTERPARTIES)
+        amt = round(random.uniform(500, income*0.08), 2)
+        b_before, b_after = _debit(amt)
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.UPI_DEBIT,
-            amount=round(random.uniform(500, income*0.08), 2),
+            amount=amt,
             merchant_category=MerchantCategory.SHOPPING,
-            payment_channel="UPI", txn_timestamp=now,
+            payment_channel="UPI",
+            platform="UPI",
+            counterparty_id=cp[0],
+            counterparty_name=cp[1],
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
+            txn_timestamp=now,
         )
+
     elif kind == "atm_small":
+        amt = random.choice([500, 1000, 2000])
+        b_before, b_after = _debit(amt)
+        city = customer.get("geography", "Mumbai")
+        bank = random.choice(["SBI", "HDFC", "ICICI", "AXIS", "PNB", "KOTAK"])
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.ATM_WITHDRAWAL,
-            amount=random.choice([500, 1000, 2000]),
-            payment_channel="ATM", txn_timestamp=now,
+            amount=amt,
+            payment_channel="ATM",
+            platform="ATM",
+            counterparty_id=f"{bank}_ATM_{city.upper()[:3]}",
+            counterparty_name=f"{bank} ATM {city}",
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
+            txn_timestamp=now,
         )
+
     elif kind == "atm_large":
+        amt = random.choice([5000, 10000])
+        b_before, b_after = _debit(amt)
+        city = customer.get("geography", "Mumbai")
+        bank = random.choice(["SBI", "HDFC", "ICICI", "AXIS"])
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.ATM_WITHDRAWAL,
-            amount=random.choice([5000, 10000]),
-            payment_channel="ATM", txn_timestamp=now,
+            amount=amt,
+            payment_channel="ATM",
+            platform="ATM",
+            counterparty_id=f"{bank}_ATM_{city.upper()[:3]}",
+            counterparty_name=f"{bank} ATM {city}",
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
+            txn_timestamp=now,
         )
+
     elif kind == "savings_drain":
+        amt = round(max(1000, savings_bal * random.uniform(0.05, 0.25) * stress), 2)
+        b_before, b_after = _debit(amt)
+        # P2P transfer to individual
+        first = fake.first_name().lower()
+        last = fake.last_name().lower()
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.SAVINGS_WITHDRAWAL,
-            amount=round(max(1000, customer["avg_savings_balance"] *
-                             random.uniform(0.05, 0.25) * stress), 2),
-            payment_channel="NEFT", txn_timestamp=now,
+            amount=amt,
+            payment_channel="NEFT",
+            platform="NEFT",
+            counterparty_id=f"{first}.{last}@sbi",
+            counterparty_name=f"{first.title()} {last.title()}",
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
+            txn_timestamp=now,
         )
+
     elif kind == "lending_app":
+        cp = random.choice(LENDING_COUNTERPARTIES)
+        amt = round(random.uniform(2000, min(30000, income*0.6)), 2)
+        b_before, b_after = _debit(amt)
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.UPI_DEBIT,
-            amount=round(random.uniform(2000, min(30000, income*0.6)), 2),
+            amount=amt,
             merchant_category=MerchantCategory.LENDING_APP,
             payment_channel="UPI",
+            platform="UPI",
+            counterparty_id=cp[0],
+            counterparty_name=cp[1],
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
             txn_timestamp=now,
             is_lending_app_upi=True,
         )
+
     elif kind == "utility_fail":
+        cp = random.choice(UTILITY_COUNTERPARTIES)
+        amt = round(random.uniform(300, 3000), 2)
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.SAVINGS,
             txn_type=TransactionType.UTILITY_PAYMENT,
-            amount=round(random.uniform(300, 3000), 2),
+            amount=amt,
             merchant_category=MerchantCategory.UTILITIES,
-            payment_channel="UPI",
+            payment_channel="BBPS",
+            platform="BBPS",
+            counterparty_id=cp[0],
+            counterparty_name=cp[1],
+            reference_number=_gen_utr(),
+            balance_before=round(savings_bal, 2),
+            balance_after=round(savings_bal, 2),  # failed: no change
             payment_status=PaymentStatus.FAILED,
             txn_timestamp=now,
         )
+
+    elif kind == "p2p_transfer":
+        first = fake.first_name().lower()
+        last = fake.last_name().lower()
+        bank_suffix = random.choice(["okaxis", "oksbi", "okhdfcbank", "ybl", "ibl", "paytm"])
+        amt = round(random.uniform(100, income * 0.1), 2)
+        b_before, b_after = _debit(amt)
+        return TransactionEvent(
+            customer_id=cid, account_type=AccountType.SAVINGS,
+            txn_type=TransactionType.UPI_DEBIT,
+            amount=amt,
+            merchant_category=MerchantCategory.OTHER,
+            payment_channel="UPI",
+            platform="UPI",
+            counterparty_id=f"{first}.{last}@{bank_suffix}",
+            counterparty_name=f"{first.title()} {last.title()}",
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=b_after,
+            txn_timestamp=now,
+            is_p2p_transfer=True,
+        )
+
     else:  # credit_card_spend
+        cp = random.choice(
+            DINING_COUNTERPARTIES + GROCERY_COUNTERPARTIES + SHOPPING_COUNTERPARTIES
+        )
+        amt = round(random.uniform(500, credit*0.12), 2) if credit > 0 else round(random.uniform(500, 5000), 2)
+        cc_used = customer.get("credit_used", 0)
+        b_before = round(cc_used, 2)
+        cc_after = round(cc_used + amt, 2)
+        customer["credit_used"] = cc_after
         return TransactionEvent(
             customer_id=cid, account_type=AccountType.CREDIT_CARD,
             txn_type=TransactionType.CREDIT_CARD_PAYMENT,
-            amount=round(random.uniform(500, credit*0.12), 2),
+            amount=amt,
             merchant_category=random.choice([
                 MerchantCategory.GROCERIES, MerchantCategory.DINING,
                 MerchantCategory.SHOPPING]),
-            payment_channel="POS", txn_timestamp=now,
+            payment_channel="POS",
+            platform="POS",
+            counterparty_id=cp[0],
+            counterparty_name=cp[1],
+            reference_number=_gen_utr(),
+            balance_before=b_before,
+            balance_after=cc_after,
+            txn_timestamp=now,
         )
 
 
