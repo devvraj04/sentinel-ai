@@ -14,6 +14,8 @@ from typing import Optional
  
 import boto3
 from botocore.exceptions import ClientError
+from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Key
  
 from config.logging_config import get_logger
 from config.settings import get_settings
@@ -39,8 +41,7 @@ class InterventionTrigger:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=settings.intervention_cooldown_hours)).isoformat()
         try:
             response = self._interventions_table.query(
-                KeyConditionExpression="customer_id = :cid AND triggered_at > :cutoff",
-                ExpressionAttributeValues={":cid": customer_id, ":cutoff": cutoff},
+                KeyConditionExpression=Key('customer_id').eq(customer_id) & Key('triggered_at').gt(cutoff),
                 Limit=1,
             )
             return len(response.get("Items", [])) > 0
@@ -52,8 +53,7 @@ class InterventionTrigger:
         month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0).isoformat()
         try:
             response = self._interventions_table.query(
-                KeyConditionExpression="customer_id = :cid AND triggered_at > :start",
-                ExpressionAttributeValues={":cid": customer_id, ":start": month_start},
+                KeyConditionExpression=Key('customer_id').eq(customer_id) & Key('triggered_at').gt(month_start),
                 Select="COUNT",
             )
             return response.get("Count", 0)

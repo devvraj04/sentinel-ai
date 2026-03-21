@@ -325,6 +325,7 @@ def train():
             m.fit(
                 X_train.iloc[tr_idx], y_train.iloc[tr_idx],
                 eval_set=[(X_train.iloc[val_idx], y_train.iloc[val_idx])],
+                feature_name=feature_cols,
                 callbacks=[
                     lgb.early_stopping(60, verbose=False),
                     lgb.log_evaluation(-1),
@@ -345,7 +346,7 @@ def train():
         # ── Final model — train on full train set ─────────────────────────────
         print("\nTraining final model on full train set...")
         model = lgb.LGBMClassifier(**params)
-        model.fit(X_train, y_train, callbacks=[lgb.log_evaluation(-1)])
+        model.fit(X_train, y_train, feature_name=feature_cols, callbacks=[lgb.log_evaluation(-1)])
 
 
         # ── ECL threshold — selected on TRAIN predictions (not test) ─────────

@@ -26,6 +26,7 @@ import boto3
 import joblib
 import numpy as np
 import psycopg2
+from psycopg2 import pool as _pgpool
 import redis
 from botocore.config import Config
 
@@ -37,6 +38,8 @@ from serving.bentoml_service.scoring_utils import (
 
 settings = get_settings()
 logger   = get_logger(__name__)
+
+_pool = _pgpool.SimpleConnectionPool(1, 10, settings.database_url)
 
 MODEL_PATH = "models/lightgbm/lgbm_model.joblib"
 SHAP_PATH  = "models/lightgbm/shap_explainer.joblib"
@@ -95,6 +98,7 @@ def _get_dynamodb_resource():
         region_name=settings.aws_region,
         aws_access_key_id=settings.aws_access_key_id,
         aws_secret_access_key=settings.aws_secret_access_key,
+        endpoint_url=settings.dynamodb_endpoint,
         config=Config(connect_timeout=5, read_timeout=5,
                       retries={"max_attempts": 1}),
     )
@@ -212,6 +216,7 @@ def _write_score_to_postgres(result: dict) -> None:
     Every call produces a NEW history row. DynamoDB keeps the current
     score (latest wins); PostgreSQL keeps every score ever computed.
     """
+    conn = None
     try:
         import json as _json
         top_factors = result.get("top_factors", [])
@@ -223,40 +228,42 @@ def _write_score_to_postgres(result: dict) -> None:
             for f in top_factors
         ]) if top_factors else None
 
-        conn = psycopg2.connect(settings.database_url)
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO pulse_score_history (
-                        customer_id, pulse_score, risk_tier, pd_probability,
-                        confidence, top_factor_1, top_factor_2, top_factor_3,
-                        shap_values, model_version,
-                        intervention_flag, intervention_type,
-                        scored_at
-                    ) VALUES (
-                        %s, %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s,
-                        %s, %s,
-                        %s
-                    )
-                """, (
-                    result["customer_id"],
-                    result["pulse_score"],
-                    result["risk_tier"],
-                    round(result["pd_probability"], 6),
-                    round(result.get("confidence", 0.0), 4),
-                    f1, f2, f3,
-                    shap_json,
-                    result.get("model_version", "unknown"),
-                    result.get("intervention_recommended", False),
-                    result.get("intervention_type") or "none",
-                    result["scored_at"],
-                ))
-        conn.close()
+        conn = _pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pulse_score_history (
+                    customer_id, pulse_score, risk_tier, pd_probability,
+                    confidence, top_factor_1, top_factor_2, top_factor_3,
+                    shap_values, model_version,
+                    intervention_flag, intervention_type,
+                    scored_at
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s
+                )
+            """, (
+                result["customer_id"],
+                result["pulse_score"],
+                result["risk_tier"],
+                round(result["pd_probability"], 6),
+                round(result.get("confidence", 0.0), 4),
+                f1, f2, f3,
+                shap_json,
+                result.get("model_version", "unknown"),
+                result.get("intervention_recommended", False),
+                result.get("intervention_type") or "none",
+                result["scored_at"],
+            ))
+        conn.commit()
     except Exception as e:
         logger.error("PostgreSQL pulse_score_history write failed",
                      customer_id=result.get("customer_id"), error=str(e))
+    finally:
+        if conn:
+            _pool.putconn(conn)
 
 
 def _write_score_to_both(dynamo, result: dict) -> None:
@@ -343,8 +350,9 @@ class PulseScorer:
         Never generates a random or hardcoded score.
         """
         # Primary: PostgreSQL pulse_score_history (full details)
+        conn = None
         try:
-            conn = psycopg2.connect(settings.database_url)
+            conn = _pool.getconn()
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT pulse_score, risk_tier, pd_probability,
@@ -355,7 +363,6 @@ class PulseScorer:
                     LIMIT 1
                 """, (customer_id,))
                 row = cur.fetchone()
-            conn.close()
             if row:
                 score, tier, pd, conf, top_f, mv, scored_at = row
                 recommended, iv_type = get_intervention(tier)
@@ -379,6 +386,9 @@ class PulseScorer:
                 }
         except Exception as e:
             logger.warning("PostgreSQL fallback read failed", customer_id=customer_id, error=str(e))
+        finally:
+            if conn:
+                _pool.putconn(conn)
 
         # Secondary: DynamoDB current score record
         try:

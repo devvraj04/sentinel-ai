@@ -247,11 +247,11 @@ class BehavioralSignalEngine:
         """
         # Feature-level weekly amounts for drift computation
         feature_funcs = {
-            "salary_delay":    lambda d: self._salary_delay(d),
-            "balance_drop":    lambda d: max(0, self._balance_drop(d)),
-            "upi_lending":     lambda d: self._upi_lending_spike(d, pd.DataFrame()),
-            "atm_withdrawal":  lambda d: self._atm_spike(d, pd.DataFrame()),
-            "util_latency":    lambda d: self._utility_latency(d),
+            "salary_delay":    lambda s, h: self._salary_delay(s),
+            "balance_drop":    lambda s, h: max(0, self._balance_drop(s)),
+            "upi_lending":     lambda s, h: self._upi_lending_spike(s, h),
+            "atm_withdrawal":  lambda s, h: self._atm_spike(s, h),
+            "util_latency":    lambda s, h: self._utility_latency(s),
         }
  
         # Split history into 14-day chunks for variance estimation
@@ -264,8 +264,8 @@ class BehavioralSignalEngine:
  
         for fname, func in feature_funcs.items():
             try:
-                current_val = func(df_short)
-                hist_val = func(df_hist) if not df_hist.empty else current_val
+                current_val = func(df_short, df_hist)
+                hist_val = func(df_hist, pd.DataFrame()) if not df_hist.empty else current_val
                 # Simple drift: normalized deviation
                 sigma = max(abs(hist_val) * 0.3, 0.1)  # Assume 30% std dev of mean
                 drift = (current_val - hist_val) / sigma

@@ -1,0 +1,128 @@
+SENTINEL AI
+Version 3 — Complete Code Audit Report
+Audit Date: March 2026  |  Scanned against v1, v2, v3
+4 Critical  |  5 High  |  4 Medium  |  1 Low  |  6 Fixed from v2
+
+Fixes vs Previous Version
+
+1. New Critical Issues in v3
+1.1  Shipped Model Has Anonymous Features — All SHAP Attribution is Wrong
+The single most important finding in v3. The model binary reveals itself in lgbm_model.txt:
+feature_names=Column_0 Column_1 Column_2 Column_3 Column_4 Column_5 Column_6 Column_7 Column_8 Column_9 Column_10
+max_feature_idx=10   →   11 unnamed features, version=v4
+The model was trained without passing feature_name to LightGBM's fit(). There are now three completely inconsistent feature lists in the same codebase:
+What actually happens at runtime:
+pulse_scorer._load() reads pkg['feature_cols'] from the joblib package
+If the model was fitted on an unnamed DataFrame, feature_cols = ['Column_0'..'Column_10']
+fv = np.array([features.get(col, 0.0) for col in feature_cols]) — Redis has no keys named 'Column_0'
+All 11 values are 0.0 — model runs on all-zeros — score is always the same PD baseline
+SHAP top_factors show 'Column_0', 'Column_1' etc. — FEATURE_LABELS has no entry for these — displayed raw to users
+Fix:
+# In train_lgbm.py — pass feature names to fit()
+model.fit(X_train, y_train, feature_name=feature_cols, callbacks=[...])
+
+# Verify after training — lgbm_model.txt should show:
+# feature_names=salary_delay_days balance_wow_drop_pct upi_lending_spike_ratio ...
+1.2  Dashboard API Hardcoded to Port 8002 — FastAPI Runs on 8001
+In dashboards/lib/api.ts line 8:
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8002/api/v1';
+FastAPI must run on port 8001 because DynamoDB Local occupies port 8000. Port 8002 has nothing listening. There is no dashboards/.env.local file in the repo to provide NEXT_PUBLIC_API_URL. Without this variable, every API call from the dashboard — login, customer list, scoring, portfolio — fails with 'connection refused'. The entire dashboard is non-functional out of the box.
+Fix:
+# Create: dashboards/.env.local
+NEXT_PUBLIC_API_URL=http://localhost:8001/api/v1
+Also update the fallback URL in api.ts from :8002 to :8001 so there is a working default even without .env.local.
+1.3  Real AWS S3 Bucket Name Committed to Public Repository
+The file .sagemaker_model_uri is tracked by git and contains:
+s3://sentinel-ml-artifacts-devv/model-artifacts/sentinel-lgbm-2026-03-20-15-33-52-418/output/model.tar.gz
+This exposes your real production S3 bucket name (sentinel-ml-artifacts-devv), the model training job timestamp, and the full artifact path. The file is not in .gitignore. On a public GitHub repository this information is accessible to anyone.
+Immediate actions:
+Add .sagemaker_model_uri to .gitignore
+Remove from git history: git filter-branch --force --index-filter 'git rm --cached --ignore-unmatch .sagemaker_model_uri' --prune-empty --tag-name-filter cat -- --all
+Force push: git push origin --force --all && git push origin --force --tags
+Review S3 bucket policy — consider making the bucket private and rotating access keys
+1.4  Admin Credentials Pre-Filled in Login Form
+In dashboards/app/login/page.tsx lines 15-16:
+const [email, setEmail]       = useState('admin@sentinel.bank');
+const [password, setPassword] = useState('sentinel_admin');
+The admin username and password are pre-populated as the initial React state of the input fields. Every user who opens the dashboard sees the admin credentials already filled in. The error message on line 31 also teaches the credentials: 'Try admin@sentinel.bank / sentinel_admin'. While these are bcrypt-hashed in PostgreSQL (not plaintext in code), displaying them in the UI is a serious operational security issue.
+Fix:
+const [email, setEmail]       = useState('');
+const [password, setPassword] = useState('');
+// Also update error message to remove the credential hint:
+setError('Invalid credentials. Please contact your administrator.');
+
+2. High Severity Issues
+2.1  Intervention Cooldown Uses Wrong boto3 Syntax — Crashes Silently
+In intervention/sns_trigger/trigger.py, _is_in_cooldown() and _count_monthly_interventions() both use raw string KeyConditionExpression with the boto3 resource API:
+self._interventions_table.query(
+    KeyConditionExpression="customer_id = :cid AND triggered_at > :cutoff",
+    ExpressionAttributeValues={":cid": customer_id, ":cutoff": cutoff},
+)
+Raw string expressions only work with the boto3 DynamoDB CLIENT (low-level) API. The resource API (boto3.resource) requires Key() and Attr() objects from boto3.dynamodb.conditions. This raises ParamValidationError, which is caught by the except ClientError block and returns False — meaning no cooldown is ever enforced. A distressed customer could receive unlimited intervention messages in a single session.
+Fix:
+from boto3.dynamodb.conditions import Key
+
+self._interventions_table.query(
+    KeyConditionExpression=Key('customer_id').eq(customer_id) & Key('triggered_at').gt(cutoff),
+)
+2.2  New PostgreSQL + Redis Connection Per Scoring Call — No Connection Pool
+_write_score_to_postgres() in pulse_scorer.py calls psycopg2.connect() on every single score write. With the feature pipeline scoring on every transaction, this creates and tears down a full DB connection per event. At 100 customers in fast mode this produces hundreds of connections per second. PostgreSQL default max_connections = 100. This will produce 'FATAL: too many connections' errors under moderate load.
+feature_pipeline._write_to_feast() has the same pattern — redis_lib.from_url() creates a new Redis connection on every transaction rather than reusing a shared client.
+Fix — module-level connection pool:
+# pulse_scorer.py module level
+from psycopg2 import pool as _pgpool
+_pool = _pgpool.SimpleConnectionPool(1, 10, settings.database_url)
+
+def _write_score_to_postgres(result):
+    conn = _pool.getconn()
+    try:   # ... write ...
+    finally: _pool.putconn(conn)
+
+# feature_pipeline.py — create once at __init__ time
+self._redis = redis.from_url(settings.redis_url)  # reuse this instance
+2.3  DynamoDB endpoint_url Missing in Scorer and API Routers
+Four files create boto3 DynamoDB resources. Only one uses endpoint_url for local mode:
+Fix — add one line to all three missing files:
+boto3.resource('dynamodb', region_name=settings.aws_region,
+    endpoint_url=settings.dynamodb_endpoint,   # already in settings.py
+    aws_access_key_id=settings.aws_access_key_id, ...)
+endpoint_url is None by default in settings for production (no override needed). For local dev it is http://localhost:8000.
+2.4  _compute_drift() Passes Empty History to UPI and ATM Sub-Functions
+In behavioral_signals.py _compute_drift(), the lambdas for UPI and ATM embed pd.DataFrame() as a fixed second argument:
+'upi_lending':   lambda d: self._upi_lending_spike(d, pd.DataFrame()),
+'atm_withdrawal': lambda d: self._atm_spike(d, pd.DataFrame()),
+When hist_val = func(df_hist) is evaluated, df_hist is passed as the first positional arg (df_short parameter) and pd.DataFrame() is the second (df_hist parameter). _upi_lending_spike() and _atm_spike() return 1.0 when their df_hist arg is empty. So hist_val for these features is always 1.0, and drift = (current - 1.0) / max(0.3, 0.1) — inflating drift for any customer who currently has any lending/ATM activity at all.
+Fix:
+# Both windows must be passed through the lambda
+feature_funcs = {
+    'salary_delay':   lambda s, h: self._salary_delay(s),
+    'balance_drop':   lambda s, h: max(0, self._balance_drop(s)),
+    'upi_lending':    lambda s, h: self._upi_lending_spike(s, h),
+    'atm_withdrawal': lambda s, h: self._atm_spike(s, h),
+    'util_latency':   lambda s, h: self._utility_latency(s),
+}
+current_val = func(df_short, df_hist)
+hist_val    = func(df_hist, pd.DataFrame()) if not df_hist.empty else current_val
+2.5  secret_key Still Has Insecure Default — Unfixed Since v1
+config/settings.py line 28 — identical to v1 and v2:
+secret_key: str = Field(default='dev-secret-key-change-me')
+This is the third version this issue has been flagged. If .env is missing or does not set SECRET_KEY, all JWT tokens are signed with a publicly known string. Any attacker can forge valid tokens for any user. The fix is one character — remove the default argument entirely.
+Fix:
+secret_key: str = Field(...)  # startup fails immediately if not set in .env
+
+3. Medium Severity Issues
+3.1  to_feature_vector() Still Exports Only 9 of 46+ Expected Features
+Present since v1, still unfixed. The production scoring path (feature_pipeline → BehavioralSignalEngine → to_feature_vector → Redis → PulseScorer) writes 9 keys. The full model expects 46+ named features. Fix is blocked on Issue 1.1 — the model must be retrained with named features first. Once retrained, to_feature_vector() must be expanded in the same commit to output all features the new model uses.
+3.2  Dashboard Landing Page Says 'XGBoost' — System Uses LightGBM
+In dashboards/app/page.tsx, the phrase 'XGBoost models' appears twice (lines 17 and 55). The model is LightGBM (LGBMClassifier from lightgbm package). XGBoost is a different library. This is the product's own marketing copy describing the wrong technology to potential users and evaluators.
+3.3  Bedrock Model ID Points to Deprecated Claude Version
+bedrock_model_id: str = 'anthropic.claude-3-sonnet-20240229-v1:0'
+This is the original Claude 3 Sonnet from February 2024. The current recommended Bedrock model is anthropic.claude-3-5-sonnet-20241022-v2:0. If AWS retires the old ID, all intervention message generation silently falls through to template-based messages with no warning logged. The model ID should be in .env, not hardcoded in settings.py with a default.
+3.4  Auth Token Dual Storage — Cookie and localStorage Can Desync
+middleware.ts protects /dashboard routes by checking a sentinel_token cookie. api.ts attaches the Bearer token from localStorage. login/page.tsx sets both on successful login. On token expiry, cookie and localStorage may expire at different times, creating a state where the middleware redirects authenticated users to /login, or where API calls return 401 despite the user seeing the dashboard. A single canonical token source would eliminate this class of bug entirely.
+
+4. Complete Issue Registry
+
+5. Recommended Fix Order
+
+Audit scope: complete static analysis of all Python, TypeScript, SQL, YAML, JSON, and binary model files in sentinel-ai-main__2_.zip (v3). The lgbm_model.txt text dump was used to verify actual model training state. Every finding is directly observable in committed source — nothing is inferred.

@@ -5,7 +5,7 @@
  */
 import axios from 'axios';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8002/api/v1';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001/api/v1';
 
 export const api = axios.create({
   baseURL: API_BASE,
@@ -15,7 +15,10 @@ export const api = axios.create({
 // Attach JWT token to every request
 api.interceptors.request.use((config) => {
   if (typeof window !== 'undefined') {
-    const token = localStorage.getItem('sentinel_token');
+    const token = document.cookie
+      .split('; ')
+      .find((row) => row.startsWith('sentinel_token='))
+      ?.split('=')[1];
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -28,7 +31,7 @@ api.interceptors.response.use(
   (res) => res,
   (err) => {
     if (typeof window !== 'undefined' && err.response?.status === 401) {
-      localStorage.removeItem('sentinel_token');
+      document.cookie = 'sentinel_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
       window.location.href = '/login';
     }
     return Promise.reject(err);

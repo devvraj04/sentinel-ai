@@ -25,7 +25,7 @@ class Settings(BaseSettings):
  
     # Application
     environment: Literal["development", "staging", "production"] = "development"
-    secret_key: str = Field(default="dev-secret-key-change-me")
+    secret_key: str = Field(...)
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 480
     log_level: str = "INFO"
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     max_interventions_per_month: int = 3
  
     # Bedrock
-    bedrock_model_id: str = "anthropic.claude-3-sonnet-20240229-v1:0"
+    bedrock_model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0"
  
     @property
     def is_production(self) -> bool:
