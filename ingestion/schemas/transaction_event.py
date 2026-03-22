@@ -95,11 +95,10 @@ class TransactionEvent(BaseModel):
     # Timing
     txn_timestamp:  datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
  
-    # Derived flags (set by enrichment classifier, not the producer)
-    is_lending_app_upi:  bool = False   # True when UPI goes to a lending/NBFC app
-    is_auto_debit_failed: bool = False  # True when auto-debit bounced
-    is_p2p_transfer:     bool = False   # True when peer-to-peer UPI transfer
-    is_investment_txn:   bool = False   # True for MF/FD/investment transactions
+    # NOTE: Pre-labelling fields (is_lending_app_upi, is_auto_debit_failed,
+    # is_p2p_transfer, is_investment_txn) have been REMOVED to eliminate
+    # label leakage. The model now infers stress from raw transaction facts:
+    # merchant_category, txn_type, payment_status, counterparty patterns.
  
     # Kafka metadata (filled by consumer, not producer)
     kafka_partition:    Optional[int] = None

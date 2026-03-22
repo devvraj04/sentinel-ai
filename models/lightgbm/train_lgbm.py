@@ -114,6 +114,12 @@ FEATURE_COLS = [
     "is_mass_retail",
     "is_affluent",
     "tenure_months",
+    # Z-score features (per-customer baseline deviation)
+    "balance_zscore",
+    "salary_delay_zscore",
+    "atm_spend_zscore",
+    "lending_spend_zscore",
+    "emi_reliability_score",
 ]
 
 

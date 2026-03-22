@@ -79,8 +79,8 @@ class FeaturePipeline:
                         "payment_status": row["payment_status"] or "completed",
                         "account_type": row["account_type"] or "savings",
                         "txn_timestamp": row["txn_timestamp"].isoformat(),
-                        "is_lending_app_upi": row["merchant_category"] == "lending_app",
-                        "is_auto_debit_failed": row["txn_type"] == "auto_debit" and row["payment_status"] == "failed"
+                        # NOTE: is_lending_app_upi and is_auto_debit_failed REMOVED
+                        # (label leakage). Model infers from merchant_category + txn_type.
                     }
                     self._buffer_event(event)
 

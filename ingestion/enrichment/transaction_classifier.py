@@ -111,10 +111,11 @@ class TransactionClassifier:
 
     This classifier returns:
       - txn_type: The inferred transaction type enum value
-      - is_lending_app_upi: True if UPI to a lending/NBFC app
-      - is_p2p_transfer: True if peer-to-peer UPI transfer
-      - is_investment_txn: True if investment/FD/MF transaction
-      - is_auto_debit_failed: True if NACH auto-debit bounced
+      - merchant_category: Inferred category (lending_app, dining, etc.)
+
+    NOTE: Pre-labelling fields (is_lending_app_upi, is_p2p_transfer,
+    is_investment_txn, is_auto_debit_failed) have been REMOVED to
+    eliminate label leakage. The model infers stress from raw facts.
     """
 
     @staticmethod
@@ -132,15 +133,11 @@ class TransactionClassifier:
         Classify a raw transaction into a typed transaction.
 
         Returns dict with:
-          txn_type, is_lending_app_upi, is_p2p_transfer,
-          is_investment_txn, is_auto_debit_failed
+          txn_type, merchant_category
         """
         result = {
             "txn_type": "other",
-            "is_lending_app_upi": False,
-            "is_p2p_transfer": False,
-            "is_investment_txn": False,
-            "is_auto_debit_failed": False,
+            "merchant_category": merchant_category or "other",
         }
 
         cp_id = (counterparty_id or "").lower().strip()
@@ -159,14 +156,12 @@ class TransactionClassifier:
         # ── Rule 2: NACH/ECS auto-debit (EMI)
         if plat in ("nach", "ecs", "ecs_debit") or _matches_any(combined, EMI_KEYWORDS):
             result["txn_type"] = "auto_debit"
-            if status == "failed":
-                result["is_auto_debit_failed"] = True
             return result
 
         # ── Rule 3: Lending app UPI
         if cp_id in LENDING_APP_VPAS or _matches_any(combined, LENDING_APP_KEYWORDS):
             result["txn_type"] = "upi_debit"
-            result["is_lending_app_upi"] = True
+            result["merchant_category"] = "lending_app"
             return result
 
         # ── Rule 4: ATM withdrawal
@@ -182,7 +177,7 @@ class TransactionClassifier:
         # ── Rule 6: Investment / MF / FD
         if _matches_any(combined, INVESTMENT_KEYWORDS) or cat in ("investment", "mutual_fund"):
             result["txn_type"] = "neft_rtgs" if is_credit else "upi_debit"
-            result["is_investment_txn"] = True
+            result["merchant_category"] = "investment"
             return result
 
         # ── Rule 7: Credit card payment
@@ -196,7 +191,7 @@ class TransactionClassifier:
                 result["txn_type"] = "upi_credit"
             else:
                 result["txn_type"] = "upi_debit"
-                result["is_p2p_transfer"] = True
+                result["merchant_category"] = "p2p"
             return result
 
         # ── Rule 9: Merchant-category based (dining/grocery/shopping/fuel)

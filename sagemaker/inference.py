@@ -311,8 +311,59 @@ def build_customers(n: int = 100) -> list[dict[str, Any]]:
 # FULL 51-FEATURE VECTOR
 # ══════════════════════════════════════════════════════════════════════════════
 
+Z_MULTIPLIER = 2.0  # flag at 2 standard deviations from the customer's own mean
+
+
+def _load_customer_baseline(customer_id: str, db_conn=None) -> dict:
+    """
+    Load per-customer baseline from PostgreSQL.
+    Returns population-level defaults if no baseline exists yet
+    (i.e. customer is new with < 14 days of history).
+    """
+    if db_conn is not None:
+        try:
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM customer_baseline WHERE customer_id = %s",
+                    (customer_id,)
+                )
+                row = cur.fetchone()
+            if row:
+                # Convert Decimal fields to float
+                row_dict = dict(row) if hasattr(row, 'keys') else dict(zip([desc[0] for desc in cur.description], row))
+                result = {}
+                for k, v in row_dict.items():
+                    try:
+                        result[k] = float(v) if v is not None and k != 'customer_id' and k != 'computed_at' and k != 'updated_at' else v
+                    except (TypeError, ValueError):
+                        result[k] = v
+                return result
+        except Exception:
+            pass  # Fall through to defaults
+
+    # No baseline yet — use conservative population defaults
+    return {
+        "balance_mean":            0.0,
+        "balance_std":             1.0,
+        "balance_drop_threshold":  0.30,
+        "salary_day_mean":         3.0,
+        "salary_day_std":          2.0,
+        "salary_delay_threshold":  7.0,
+        "atm_spike_threshold":     3.0,
+        "atm_monthly_mean":        0.0,
+        "atm_monthly_std":         1.0,
+        "lending_spike_threshold": 2.5,
+        "upi_to_lending_mean":     0.0,
+        "upi_to_lending_std":      100.0,
+        "emi_success_rate":        1.0,
+        "cc_utilization_mean":     0.3,
+        "cc_utilization_std":      0.1,
+    }
+
+
 def build_feature_vector(customer: dict, df: pd.DataFrame,
-                         reference_date: datetime) -> dict[str, float]:
+                         reference_date: datetime,
+                         db_conn=None) -> dict[str, float]:
     income     = float(customer["monthly_income"])
     emi        = float(customer["emi_amount"])
     credit_lim = float(customer["credit_limit"])
@@ -362,12 +413,12 @@ def build_feature_vector(customer: dict, df: pd.DataFrame,
     fv["balance_wow_drop_pct"]  = wow_drop
     fv["savings_runway_months"] = min(customer["avg_savings_balance"]/max(income,1), 24.0)
 
-    # Lending UPI
-    def csum(fr, col, val):
-        if fr.empty or col not in fr.columns: return 0.0
-        return float(fr[fr[col]==val]["amount"].sum())
-    lend_s = csum(df_short, "is_lending_app_upi", True)
-    lend_h = csum(df_hist,  "is_lending_app_upi", True)
+    # Lending UPI — inferred from merchant_category, NOT from pre-labelled field
+    def csum_cat(fr, cat_val):
+        if fr.empty or "merchant_category" not in fr.columns: return 0.0
+        return float(fr[fr["merchant_category"]==cat_val]["amount"].sum())
+    lend_s = csum_cat(df_short, "lending_app")
+    lend_h = csum_cat(df_hist,  "lending_app")
     h_avg  = lend_h / (76/14) if lend_h > 0 else 0.0
     if lend_s == 0.0:
         lend_r = 1.0
@@ -428,13 +479,30 @@ def build_feature_vector(customer: dict, df: pd.DataFrame,
     fv["monthly_income"]       = income
     fv["ead_estimate"]         = float(emi * 24)
 
-    # Flags
-    fv["flag_salary"]          = 1.0 if delay > 7 else 0.0
-    fv["flag_balance"]         = 1.0 if wow_drop > 0.3 else 0.0
-    fv["flag_lending"]         = 1.0 if lend_s > income*0.15 else 0.0
+    # ── Load per-customer baseline for personalised thresholds ─────────────
+    baseline = _load_customer_baseline(customer["customer_id"], db_conn)
+
+    # Flags — personalised per-customer thresholds (NOT population-level)
+    # Salary delay — personalised threshold from this customer's history
+    fv["flag_salary"]          = 1.0 if delay > baseline.get("salary_delay_threshold", 7.0) else 0.0
+
+    # Balance drop — personalised threshold
+    current_balance = customer.get("savings_balance", customer.get("avg_savings_balance", 0))
+    bal_mean = baseline.get("balance_mean", 0.0)
+    bal_std  = baseline.get("balance_std", 1.0)
+    balance_z = (bal_mean - current_balance) / max(bal_std, 1.0) if bal_mean > 0 else wow_drop / 0.3
+    fv["flag_balance"]         = 1.0 if balance_z > Z_MULTIPLIER else 0.0
+
+    # Lending spike — personalised threshold
+    fv["flag_lending"]         = 1.0 if lend_s > (baseline.get("upi_to_lending_mean", 0) +
+                                  Z_MULTIPLIER * baseline.get("upi_to_lending_std", 100.0)) else 0.0
+
     fv["flag_utility"]         = 1.0 if fv["utility_payment_latency"] > 22 else 0.0
     fv["flag_discretionary"]   = 1.0 if disc_r < 0.3 else 0.0
-    fv["flag_atm"]             = 1.0 if atm_sp > 3.0 else 0.0
+
+    # ATM spike — personalised threshold
+    fv["flag_atm"]             = 1.0 if atm_sp > baseline.get("atm_spike_threshold", 3.0) else 0.0
+
     fv["flag_failed_debit"]    = 1.0 if len(fd14) > 0 else 0.0
     fv["flag_emi_burden"]      = 1.0 if emi/max(income,1) > 0.55 else 0.0
     fv["flag_high_utilization"]= 1.0 if fv["revolving_utilization"] > 0.85 else 0.0
@@ -456,21 +524,31 @@ def build_feature_vector(customer: dict, df: pd.DataFrame,
     fv["composite_drift_score"] = float(np.mean([abs(fv[f"drift_{k}"])
         for k in ["salary","balance","lending","atm","auto_debit"]]))
 
-    # P2P transfer spike — computed from actual P2P UPI transfers
-    p2p_cols = ["is_p2p_transfer"] if "is_p2p_transfer" in df.columns else []
-    if p2p_cols and not df_short.empty:
-        p2p_s = df_short[df_short.get("is_p2p_transfer", pd.Series(dtype=bool)) == True]["amount"].sum() if "is_p2p_transfer" in df_short.columns else 0.0
-        p2p_h = df_hist[df_hist.get("is_p2p_transfer", pd.Series(dtype=bool)) == True]["amount"].sum() if not df_hist.empty and "is_p2p_transfer" in df_hist.columns else 0.0
+    # P2P transfer spike — inferred from UPI debits to non-merchant counterparties
+    if not df_short.empty:
+        merchant_cats = {"lending_app", "dining", "shopping", "groceries", "utilities", "fuel"}
+        p2p_s = df_short[
+            (df_short["txn_type"]=="upi_debit") &
+            (~df_short["merchant_category"].isin(merchant_cats))
+        ]["amount"].sum() if "merchant_category" in df_short.columns else 0.0
+        p2p_h = df_hist[
+            (df_hist["txn_type"]=="upi_debit") &
+            (~df_hist["merchant_category"].isin(merchant_cats))
+        ]["amount"].sum() if not df_hist.empty and "merchant_category" in df_hist.columns else 0.0
         p2p_avg = p2p_h / (76/14) if p2p_h > 0 else 0.0
         fv["p2p_transfer_spike"] = float(np.clip(p2p_s / max(p2p_avg, income * 0.02, 1), 0.5, 10.0))
     else:
-        fv["p2p_transfer_spike"] = 1.0 if df_short.empty else float(np.clip(
-            len(df_short[df_short["txn_type"]=="upi_debit"]) / max(len(df_short) * 0.3, 1), 0.5, 5.0))
+        fv["p2p_transfer_spike"] = 1.0
 
-    # Investment redemption % — from investment/FD withdrawal transactions
-    if "is_investment_txn" in df.columns and not df_90.empty:
-        inv_txns = df_90[df_90.get("is_investment_txn", pd.Series(dtype=bool)) == True] if "is_investment_txn" in df_90.columns else pd.DataFrame()
-        fv["investment_redemption_pct"] = float(inv_txns["amount"].sum() / max(customer["avg_savings_balance"], 1)) if not inv_txns.empty else 0.0
+    # Investment redemption % — inferred from counterparty keywords
+    _inv_keywords = {"mutual_fund", "sip", "zerodha", "groww", "kuvera", "fd_withdrawal",
+                     "rd_maturity", "ppf", "nps", "sgb", "smallcase", "upstox"}
+    if not df_90.empty and "counterparty_name" in df_90.columns:
+        inv_mask = df_90["counterparty_name"].fillna("").str.lower().apply(
+            lambda x: any(kw in x for kw in _inv_keywords)
+        )
+        inv_amt = float(df_90.loc[inv_mask, "amount"].sum()) if inv_mask.any() else 0.0
+        fv["investment_redemption_pct"] = float(inv_amt / max(customer["avg_savings_balance"], 1))
     else:
         fv["investment_redemption_pct"] = 0.0
 
@@ -484,6 +562,51 @@ def build_feature_vector(customer: dict, df: pd.DataFrame,
     fv["is_self_employed"] = 1.0 if emp == "self_employed"  else 0.0
     fv["is_mass_retail"]   = 1.0 if segment == "mass_retail" else 0.0
     fv["is_affluent"]      = 1.0 if segment in ("affluent", "hni") else 0.0
+
+    # ── Z-SCORE FEATURES (personalised deviation from baseline) ─────────────
+    # These tell the model HOW FAR this customer is from their own normal,
+    # not whether they crossed an arbitrary population threshold.
+
+    # Balance Z-score: positive means balance has dropped below customer's mean
+    if baseline.get("balance_std", 0) > 0 and baseline.get("balance_mean", 0) > 0:
+        current_bal = current_balance if current_balance else customer.get("avg_savings_balance", 0)
+        fv["balance_zscore"] = float(np.clip(
+            (baseline["balance_mean"] - current_bal) / baseline["balance_std"],
+            -5, 5
+        ))
+    else:
+        fv["balance_zscore"] = 0.0
+
+    # Salary delay Z-score
+    fv["salary_delay_zscore"] = float(np.clip(
+        (delay - baseline.get("salary_day_mean", 3.0)) / max(baseline.get("salary_day_std", 0.5), 0.5),
+        -5, 5
+    ))
+
+    # ATM spending Z-score (current period vs baseline mean)
+    atm_this_month = float(df_short[df_short["txn_type"] == "atm_withdrawal"]["amount"].sum()) if not df_short.empty else 0.0
+    if baseline.get("atm_monthly_std", 0) > 0 and baseline.get("atm_monthly_mean", 0) > 0:
+        fv["atm_spend_zscore"] = float(np.clip(
+            (atm_this_month - baseline["atm_monthly_mean"]) / baseline["atm_monthly_std"],
+            -5, 5
+        ))
+    else:
+        fv["atm_spend_zscore"] = 0.0
+
+    # Lending UPI Z-score
+    lend_this_month = float(df_short[df_short["merchant_category"] == "lending_app"]["amount"].sum()) if not df_short.empty and "merchant_category" in df_short.columns else 0.0
+    if baseline.get("upi_to_lending_std", 0) > 0:
+        fv["lending_spend_zscore"] = float(np.clip(
+            (lend_this_month - baseline.get("upi_to_lending_mean", 0)) / baseline["upi_to_lending_std"],
+            -5, 5
+        ))
+    else:
+        fv["lending_spend_zscore"] = 0.0
+
+    # EMI reliability Z-score
+    # Use the historical success rate deviation as a running stress signal
+    fv["emi_reliability_score"] = float(baseline.get("emi_success_rate", 1.0))  # 1.0=perfect, <1.0=bounces
+
     return fv
 
 
@@ -540,9 +663,8 @@ def score_customer(customer: dict, db_conn, dynamo_db,
         df = pd.DataFrame(rows, columns=[
             "txn_type","amount","merchant_category","payment_status",
             "account_type","txn_timestamp"])
-        df["is_lending_app_upi"]   = df["merchant_category"] == "lending_app"
-        df["is_auto_debit_failed"] = ((df["txn_type"]=="auto_debit") &
-                                      (df["payment_status"]=="failed"))
+        # NOTE: is_lending_app_upi and is_auto_debit_failed columns REMOVED
+        # (label leakage). Model now infers from merchant_category + txn_type.
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
     else:
         df = pd.DataFrame()
@@ -860,7 +982,6 @@ def next_transaction(customer: dict, seq: int, now: datetime) -> TransactionEven
             balance_after=b_after,
             payment_status=PaymentStatus.FAILED if failed else PaymentStatus.SUCCESS,
             txn_timestamp=now,
-            is_auto_debit_failed=failed,
         )
 
     elif kind == "upi_dining":
@@ -995,7 +1116,6 @@ def next_transaction(customer: dict, seq: int, now: datetime) -> TransactionEven
             balance_before=b_before,
             balance_after=b_after,
             txn_timestamp=now,
-            is_lending_app_upi=True,
         )
 
     elif kind == "utility_fail":
@@ -1036,7 +1156,6 @@ def next_transaction(customer: dict, seq: int, now: datetime) -> TransactionEven
             balance_before=b_before,
             balance_after=b_after,
             txn_timestamp=now,
-            is_p2p_transfer=True,
         )
 
     else:  # credit_card_spend
@@ -1076,9 +1195,9 @@ def is_stress(evt: TransactionEvent) -> tuple[bool, str]:
     cat = evt.merchant_category.value if hasattr(evt.merchant_category,"value") else str(evt.merchant_category)
     amt = float(evt.amount)
 
-    if getattr(evt,"is_auto_debit_failed",False) or (tt=="auto_debit" and st=="failed"):
+    if tt=="auto_debit" and st=="failed":
         return True, "FAILED EMI"
-    if getattr(evt,"is_lending_app_upi",False) or cat=="lending_app":
+    if cat=="lending_app":
         return True, "LENDING APP"
     if tt=="utility_payment" and st=="failed":
         return True, "FAILED UTILITY"

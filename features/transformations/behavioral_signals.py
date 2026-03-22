@@ -78,8 +78,10 @@ class BehavioralSignalEngine:
         merchant_category (str)
         payment_status  (str)
         account_type    (str)
-        is_lending_app_upi (bool)
-        is_auto_debit_failed (bool)
+
+    NOTE: Pre-labelling fields (is_lending_app_upi, is_auto_debit_failed)
+    have been REMOVED. Stress is now inferred from raw merchant_category
+    and txn_type + payment_status.
     """
  
     # ── Configuration ─────────────────────────────────────────────────────────
@@ -166,11 +168,12 @@ class BehavioralSignalEngine:
         return float(np.clip(drop, -5.0, 5.0))
  
     def _upi_lending_spike(self, df_short: pd.DataFrame, df_hist: pd.DataFrame) -> float:
-        """Ratio of UPI-to-lending-app spend this period vs historical average."""
-        current = df_short[df_short["is_lending_app_upi"] == True]["amount"].sum()
+        """Ratio of UPI-to-lending-app spend this period vs historical average.
+        Uses merchant_category instead of removed is_lending_app_upi label."""
+        current = df_short[df_short["merchant_category"] == "lending_app"]["amount"].sum() if "merchant_category" in df_short.columns else 0.0
         if df_hist.empty:
             return 1.0 if current == 0 else 3.0  # No baseline — treat spike as red flag
-        historical_avg = df_hist[df_hist["is_lending_app_upi"] == True]["amount"].sum()
+        historical_avg = df_hist[df_hist["merchant_category"] == "lending_app"]["amount"].sum() if "merchant_category" in df_hist.columns else 0.0
         historical_avg = historical_avg / (self.HIST_WINDOW_DAYS / self.SHORT_WINDOW_DAYS)
         if historical_avg < 1:
             return 1.0 if current < 100 else 5.0

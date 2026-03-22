@@ -476,6 +476,50 @@ def compute_labels(
     # investment_redemption_pct: exponential(3.2) → mean ≈ 3.2, std ≈ 3.2
     z += LATENT_W["investment_redemption_pct"] * _znorm(new_sig["investment_redemption_pct"].values, 3.2, 3.2)
 
+    # ── Z-score features (per-customer baseline deviation) ────────────────
+    # Simulated as correlated with the stress signals they derive from
+    # balance_zscore: correlated with balance_wow_drop_pct
+    balance_zscore = np.clip(
+        _znorm(core["balance_wow_drop_pct"].values, 4.0, 12.0) +
+        RNG.normal(0, 0.3, n), -5, 5
+    )
+    core["balance_zscore"] = balance_zscore
+
+    # salary_delay_zscore: correlated with salary_delay_days
+    salary_delay_zscore = np.clip(
+        _znorm(core["salary_delay_days"].values, 1.2, 3.3) +
+        RNG.normal(0, 0.2, n), -5, 5
+    )
+    core["salary_delay_zscore"] = salary_delay_zscore
+
+    # atm_spend_zscore: correlated with atm_withdrawal_spike
+    atm_spend_zscore = np.clip(
+        _znorm(core["atm_withdrawal_spike"].values, 1.18, 0.82) +
+        RNG.normal(0, 0.25, n), -5, 5
+    )
+    core["atm_spend_zscore"] = atm_spend_zscore
+
+    # lending_spend_zscore: correlated with upi_lending_spike_ratio
+    lending_spend_zscore = np.clip(
+        _znorm(core["upi_lending_spike_ratio"].values, 1.2, 1.0) +
+        RNG.normal(0, 0.3, n), -5, 5
+    )
+    core["lending_spend_zscore"] = lending_spend_zscore
+
+    # emi_reliability_score: inversely correlated with failed_auto_debit_count
+    emi_reliability = np.clip(
+        1.0 - core["failed_auto_debit_count"].values * 0.15 +
+        RNG.normal(0, 0.05, n), 0, 1
+    )
+    core["emi_reliability_score"] = emi_reliability
+
+    # Add Z-score features to latent logit
+    z += 0.30 * balance_zscore          # High positive Z → balance dropped → stress
+    z += 0.25 * salary_delay_zscore     # High positive Z → salary late → stress
+    z += 0.20 * atm_spend_zscore        # High positive Z → ATM spike → stress
+    z += 0.30 * lending_spend_zscore    # High positive Z → lending spike → stress
+    z += -0.35 * emi_reliability        # Low reliability → more stress (inverse)
+
 
     # ── Segment priors ────────────────────────────────────────────────────────
     z += LATENT_W["__mass_retail__"]   * profiles["is_mass_retail"].values

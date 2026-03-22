@@ -282,14 +282,14 @@ def build_feature_vector(customer: dict, df: pd.DataFrame,
                    else customer["avg_savings_balance"]
     fv["savings_runway_months"] = min(live_balance / max(income, 1), 24.0)
 
-    # ── Lending-app UPI ───────────────────────────────────────────────────
-    def csum(fr, col, val):
-        if fr.empty or col not in fr.columns:
+    # ── Lending-app UPI ── inferred from merchant_category, NOT pre-label ──
+    def csum_cat(fr, cat_val):
+        if fr.empty or "merchant_category" not in fr.columns:
             return 0.0
-        return float(fr[fr[col] == val]["amount"].sum())
+        return float(fr[fr["merchant_category"] == cat_val]["amount"].sum())
 
-    lend_s = csum(df_short, "is_lending_app_upi", True)
-    lend_h = csum(df_hist,  "is_lending_app_upi", True)
+    lend_s = csum_cat(df_short, "lending_app")
+    lend_h = csum_cat(df_hist,  "lending_app")
     h_avg  = lend_h / (76 / 14) if lend_h > 0 else 0.0
     if lend_s == 0.0:
         lend_r = 1.0
@@ -415,6 +415,14 @@ def build_feature_vector(customer: dict, df: pd.DataFrame,
     fv["is_self_employed"] = 1.0 if emp == "self_employed"         else 0.0
     fv["is_mass_retail"]   = 1.0 if segment == "mass_retail"       else 0.0
     fv["is_affluent"]      = 1.0 if segment in ("affluent", "hni") else 0.0
+
+    # ── Z-SCORE FEATURES (using population defaults in simulator) ───────
+    fv["balance_zscore"]        = float(np.clip(wow_drop / 0.3, -5, 5))  # approximate Z from drop
+    fv["salary_delay_zscore"]   = float(np.clip((delay - 3.0) / max(2.0, 0.5), -5, 5))
+    fv["atm_spend_zscore"]      = float(np.clip((atm_sp - 1.0) / 0.3, -5, 5)) if atm_sp > 1.0 else 0.0
+    fv["lending_spend_zscore"]  = float(np.clip(lend_s / max(income * 0.05, 100.0), -5, 5))
+    fv["emi_reliability_score"] = 1.0 if len(fd14) == 0 else max(0.0, 1.0 - len(fd14) * 0.2)
+
     return fv
 
 
@@ -472,9 +480,7 @@ def score_customer(customer: dict, db_conn, dynamo_db,
         df = pd.DataFrame(rows, columns=[
             "txn_type", "amount", "merchant_category",
             "payment_status", "account_type", "txn_timestamp"])
-        df["is_lending_app_upi"]   = df["merchant_category"] == "lending_app"
-        df["is_auto_debit_failed"] = ((df["txn_type"] == "auto_debit") &
-                                      (df["payment_status"] == "failed"))
+        # NOTE: is_lending_app_upi and is_auto_debit_failed REMOVED (label leakage)
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
     else:
         df = pd.DataFrame()
@@ -830,7 +836,6 @@ def next_transaction(customer: dict, now: datetime,
             payment_channel="ECS",
             payment_status=PaymentStatus.SUCCESS,
             txn_timestamp=now,
-            is_auto_debit_failed=False,
         ), kind
 
     elif kind == "upi_groceries":
@@ -964,7 +969,6 @@ def next_transaction(customer: dict, now: datetime,
             payment_channel="ECS",
             payment_status=PaymentStatus.FAILED,
             txn_timestamp=now,
-            is_auto_debit_failed=True,
         ), kind
 
     else:  # lending_app
@@ -977,7 +981,6 @@ def next_transaction(customer: dict, now: datetime,
             payment_channel="UPI",
             payment_status=PaymentStatus.SUCCESS,
             txn_timestamp=now,
-            is_lending_app_upi=True,
         ), kind
 
 
@@ -991,9 +994,9 @@ def is_stress(evt: TransactionEvent) -> tuple[bool, str]:
     cat = evt.merchant_category.value if hasattr(evt.merchant_category, "value") else str(evt.merchant_category)
     amt = float(evt.amount)
 
-    if getattr(evt, "is_auto_debit_failed", False) or (tt == "auto_debit" and st == "failed"):
+    if tt == "auto_debit" and st == "failed":
         return True, "FAILED EMI"
-    if getattr(evt, "is_lending_app_upi", False) or cat == "lending_app":
+    if cat == "lending_app":
         return True, "LENDING APP"
     if tt == "utility_payment" and st == "failed":
         return True, "FAILED UTILITY"
