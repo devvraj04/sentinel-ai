@@ -325,7 +325,6 @@ def train():
             m.fit(
                 X_train.iloc[tr_idx], y_train.iloc[tr_idx],
                 eval_set=[(X_train.iloc[val_idx], y_train.iloc[val_idx])],
-                feature_name=feature_cols,
                 callbacks=[
                     lgb.early_stopping(60, verbose=False),
                     lgb.log_evaluation(-1),
@@ -346,7 +345,20 @@ def train():
         # ── Final model — train on full train set ─────────────────────────────
         print("\nTraining final model on full train set...")
         model = lgb.LGBMClassifier(**params)
-        model.fit(X_train, y_train, feature_name=feature_cols, callbacks=[lgb.log_evaluation(-1)])
+        # X_train is a pandas DataFrame — LightGBM reads column names automatically.
+        # Do NOT pass feature_name= here; it is version-sensitive in the sklearn API
+        # and ignored/overridden when X is a DataFrame in LGB 4.x anyway.
+        model.fit(X_train, y_train, callbacks=[lgb.log_evaluation(-1)])
+
+        # Immediately verify feature names are correct — fail loud if not
+        actual_names = list(model.feature_name_)
+        if actual_names[0] == "Column_0":
+            raise RuntimeError(
+                f"Model was trained with anonymous features (Column_0..N).\n"
+                f"This means X_train lost its column names before fit().\n"
+                f"X_train type: {type(X_train)}  columns[:3]: {list(X_train.columns[:3]) if hasattr(X_train, 'columns') else 'NO COLUMNS'}"
+            )
+        print(f"  Feature names verified: {actual_names[:3]}... ({len(actual_names)} total)")
 
 
         # ── ECL threshold — selected on TRAIN predictions (not test) ─────────
@@ -520,12 +532,26 @@ def train():
         }
         joblib.dump(package,   MODEL_OUT)
         joblib.dump(explainer, SHAP_OUT)
-        mlflow.log_artifact(MODEL_OUT)
 
+        # Save text dump so lgbm_model.txt always reflects the current trained model.
+        # This is what you check with: head -5 models/lightgbm/lgbm_model.txt
+        # It should show: feature_names=salary_delay_days balance_wow_drop_pct ...
+        TXT_OUT = MODEL_OUT.replace(".joblib", ".txt")
+        model.booster_.save_model(TXT_OUT)
+
+        mlflow.log_artifact(MODEL_OUT)
 
         print(f"\n  ✓ Model  → {MODEL_OUT}")
         print(f"  ✓ SHAP   → {SHAP_OUT}")
+        print(f"  ✓ Text   → {TXT_OUT}")
         print(f"  ✓ MLflow → http://localhost:5001")
+
+        # Final sanity check — print first line of feature names from the saved txt
+        with open(TXT_OUT, "r") as _f:
+            for _line in _f:
+                if _line.startswith("feature_names="):
+                    print(f"\n  Verify: {_line.strip()[:120]}")
+                    break
 
 
     print("\n" + "=" * 65)

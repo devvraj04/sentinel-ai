@@ -604,17 +604,49 @@ def _write_history(result: dict, db_conn) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ensure_customer_postgres(customer: dict, conn) -> None:
+    """
+    Upsert customer profile including all financial fields required
+    by build_feature_vector() — emi_amount, credit_limit, etc.
+    Uses DO UPDATE so re-runs always refresh the values.
+    Requires migration 002 to have been applied first.
+    """
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO customers
                 (customer_id, full_name, email, phone, segment,
-                 geography, employment_status, monthly_income)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (customer_id) DO NOTHING
-        """, (customer["customer_id"], customer["full_name"],
-              customer["email"], customer["phone"], customer["segment"],
-              customer["geography"], customer["employment_status"],
-              customer["monthly_income"]))
+                 geography, employment_status, monthly_income,
+                 emi_amount, credit_limit, avg_savings_balance,
+                 tenure_months, expected_salary_day, preferred_channel,
+                 product_mix)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (customer_id) DO UPDATE SET
+                full_name           = EXCLUDED.full_name,
+                monthly_income      = EXCLUDED.monthly_income,
+                emi_amount          = EXCLUDED.emi_amount,
+                credit_limit        = EXCLUDED.credit_limit,
+                avg_savings_balance = EXCLUDED.avg_savings_balance,
+                tenure_months       = EXCLUDED.tenure_months,
+                expected_salary_day = EXCLUDED.expected_salary_day,
+                preferred_channel   = EXCLUDED.preferred_channel,
+                product_mix         = EXCLUDED.product_mix,
+                updated_at          = NOW()
+        """, (
+            customer["customer_id"],
+            customer["full_name"],
+            customer["email"],
+            customer["phone"],
+            customer["segment"],
+            customer["geography"],
+            customer["employment_status"],
+            float(customer["monthly_income"]),
+            float(customer["emi_amount"]),
+            float(customer["credit_limit"]),
+            float(customer["avg_savings_balance"]),
+            int(customer.get("tenure_months", 24)),
+            int(customer.get("salary_day", 3)),
+            customer.get("preferred_channel", "UPI"),
+            customer.get("product_mix", "both"),
+        ))
     conn.commit()
 
 

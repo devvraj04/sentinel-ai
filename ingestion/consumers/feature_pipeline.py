@@ -128,18 +128,66 @@ class FeaturePipeline:
             df = pd.DataFrame(buf)
             df["txn_timestamp"] = pd.to_datetime(df["txn_timestamp"], utc=True)
 
-            # 1. Fetch live customer profile from PostgreSQL to get salary, loans, segment, etc.
+            # 1. Fetch live customer profile from PostgreSQL.
+            #    LEFT JOIN accounts to get emi_amount and credit_limit in case
+            #    migration 002 has not yet added those columns to the customers table.
             import psycopg2
             import psycopg2.extras
             conn = psycopg2.connect(settings.database_url, cursor_factory=psycopg2.extras.RealDictCursor)
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM customers WHERE customer_id = %s", (customer_id,))
+                cur.execute("""
+                    SELECT
+                        c.*,
+                        COALESCE(c.emi_amount,    a_loan.emi_amount,    0)      AS emi_amount,
+                        COALESCE(c.credit_limit,  a_cc.credit_limit,    0)      AS credit_limit,
+                        COALESCE(c.avg_savings_balance,                 0)      AS avg_savings_balance,
+                        COALESCE(c.tenure_months,                       24)     AS tenure_months,
+                        COALESCE(c.expected_salary_day,                 3)      AS salary_day,
+                        COALESCE(c.preferred_channel,                   'UPI')  AS preferred_channel,
+                        COALESCE(c.product_mix,                         'both') AS product_mix
+                    FROM customers c
+                    LEFT JOIN LATERAL (
+                        SELECT emi_amount FROM accounts
+                        WHERE customer_id = c.customer_id
+                          AND account_type = 'loan' AND status = 'active'
+                        ORDER BY opened_at DESC LIMIT 1
+                    ) a_loan ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT credit_limit FROM accounts
+                        WHERE customer_id = c.customer_id
+                          AND account_type = 'credit_card' AND status = 'active'
+                        ORDER BY opened_at DESC LIMIT 1
+                    ) a_cc ON TRUE
+                    WHERE c.customer_id = %s
+                """, (customer_id,))
                 customer = cur.fetchone()
             conn.close()
 
             if not customer:
                 logger.warning("Customer profile not found in Postgres, skipping features", customer_id=customer_id)
                 return
+
+            # Convert to plain dict and cast every NUMERIC column to float.
+            # psycopg2 returns NUMERIC as decimal.Decimal which breaks
+            # arithmetic in build_feature_vector() (Decimal / float → TypeError).
+            customer = dict(customer)
+            _NUMERIC_FIELDS = [
+                "monthly_income", "emi_amount", "credit_limit",
+                "avg_savings_balance", "savings_balance",
+                "current_account_balance", "total_loan_amount",
+            ]
+            for _f in _NUMERIC_FIELDS:
+                if customer.get(_f) is not None:
+                    customer[_f] = float(customer[_f])
+
+            # Safe defaults for any field still missing after the query
+            customer.setdefault("emi_amount",          0.0)
+            customer.setdefault("credit_limit",        0.0)
+            customer.setdefault("avg_savings_balance", 0.0)
+            customer.setdefault("tenure_months",       24)
+            customer.setdefault("salary_day",          3)
+            customer.setdefault("preferred_channel",   "UPI")
+            customer.setdefault("product_mix",         "both")
 
             # 2. Compute the exact 46 features expected by LightGBM
             from sagemaker.inference import build_feature_vector
