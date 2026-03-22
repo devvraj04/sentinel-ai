@@ -1,8 +1,15 @@
 """
 ingestion/enrichment/transaction_classifier.py
 ──────────────────────────────────────────────────────────────────────────────
-Infers transaction type from raw transaction signals (counterparty, platform,
-MCC, amount patterns). The producer sends RAW data — this classifier labels it.
+Infers transaction purpose from raw counterparty and platform facts.
+
+DESIGN PRINCIPLE:
+  This classifier reads the raw sender_id, receiver_id, sender_name,
+  receiver_name, platform, and payment_status from the TransactionEvent
+  and returns an inferred classification dict used ONLY by the feature
+  pipeline for computing features. It does NOT modify the TransactionEvent.
+  The model never sees these inferences directly — it sees the Z-scores
+  and ratios computed from them.
 
 Indian Banking Context:
   - Known UPI lending apps: Slice, LazyPay, KreditBee, MoneyView, etc.
@@ -97,148 +104,110 @@ FUEL_KEYWORDS = frozenset({
 
 # ── Classification Engine ─────────────────────────────────────────────────────
 
-class TransactionClassifier:
+def classify(
+    sender_id: str | None,
+    receiver_id: str | None,
+    sender_name: str | None,
+    receiver_name: str | None,
+    platform: str,
+    payment_status: str,
+    amount: float,
+) -> dict:
     """
-    Infers transaction type from raw signals.
+    Infer transaction purpose from raw counterparty and platform facts.
 
-    The producer sends raw transactions with:
-      - counterparty_id (e.g., "swiggy@upi")
-      - counterparty_name (e.g., "Swiggy")
-      - platform (UPI/NEFT/IMPS/RTGS/NACH/BBPS/POS/ATM/NetBanking)
-      - merchant_category (MCC-based or keyword)
-      - amount
-      - payment_status
+    Returns a classification dict used by build_feature_vector() ONLY.
+    This classification is NOT stored on the TransactionEvent.
+    The model never directly reads these fields.
 
-    This classifier returns:
-      - txn_type: The inferred transaction type enum value
-      - merchant_category: Inferred category (lending_app, dining, etc.)
-
-    NOTE: Pre-labelling fields (is_lending_app_upi, is_p2p_transfer,
-    is_investment_txn, is_auto_debit_failed) have been REMOVED to
-    eliminate label leakage. The model infers stress from raw facts.
+    The inference chain:
+    1. receiver_id/name against known VPA databases (lending apps, utilities, etc.)
+    2. platform type (ECS → likely EMI, NEFT_credit → likely salary)
+    3. Amount patterns (e.g. round ₹X,000 from NACH → EMI)
+    4. Keyword matching on receiver_name
     """
+    r_id   = (receiver_id   or "").lower()
+    s_id   = (sender_id     or "").lower()
+    r_name = (receiver_name or "").lower()
+    s_name = (sender_name   or "").lower()
+    plat   = platform.lower()
 
-    @staticmethod
-    def classify(
-        amount: float,
-        platform: str,
-        counterparty_id: Optional[str],
-        counterparty_name: Optional[str],
-        merchant_category: str,
-        payment_status: str,
-        account_type: str,
-        is_credit: bool = False,
-    ) -> dict:
-        """
-        Classify a raw transaction into a typed transaction.
+    # ── Lending app detection ─────────────────────────────────────────────────
+    is_likely_lending = (
+        any(k in r_id for k in LENDING_APP_VPAS) or
+        any(k in r_name for k in LENDING_APP_KEYWORDS) or
+        any(k in r_id for k in LENDING_APP_KEYWORDS)
+    )
 
-        Returns dict with:
-          txn_type, merchant_category
-        """
-        result = {
-            "txn_type": "other",
-            "merchant_category": merchant_category or "other",
-        }
+    # ── Salary detection ──────────────────────────────────────────────────────
+    # Salary arrives via NEFT/IMPS from employer, not UPI from individual
+    is_likely_salary = (
+        plat in ("neft", "imps", "rtgs") and
+        (any(k in s_name for k in SALARY_KEYWORDS) or
+         any(k in s_id  for k in SALARY_KEYWORDS)) and
+        amount > 5000  # salaries are not small amounts
+    )
 
-        cp_id = (counterparty_id or "").lower().strip()
-        cp_name = (counterparty_name or "").lower().strip()
-        plat = (platform or "").lower().strip()
-        cat = (merchant_category or "").lower().strip()
-        status = (payment_status or "").lower().strip()
-        acct = (account_type or "").lower().strip()
-        combined = f"{cp_id} {cp_name}"
+    # ── EMI / auto-debit detection ────────────────────────────────────────────
+    # ECS/NACH debits are almost always EMIs
+    is_likely_emi = (
+        plat in ("ecs", "nach", "mandate") or
+        any(k in r_name for k in EMI_KEYWORDS) or
+        any(k in r_id   for k in EMI_KEYWORDS)
+    )
 
-        # ── Rule 1: Salary credit (NEFT/IMPS credit from known employer)
-        if is_credit and _matches_any(combined, SALARY_KEYWORDS):
-            result["txn_type"] = "salary_credit"
-            return result
+    # ── Utility bill detection ────────────────────────────────────────────────
+    is_likely_utility = (
+        plat == "bbps" or
+        any(k in r_id   for k in UTILITY_BILLER_KEYWORDS) or
+        any(k in r_name for k in UTILITY_BILLER_KEYWORDS)
+    )
 
-        # ── Rule 2: NACH/ECS auto-debit (EMI)
-        if plat in ("nach", "ecs", "ecs_debit") or _matches_any(combined, EMI_KEYWORDS):
-            result["txn_type"] = "auto_debit"
-            return result
+    # ── ATM cash withdrawal ───────────────────────────────────────────────────
+    is_atm = plat == "atm"
 
-        # ── Rule 3: Lending app UPI
-        if cp_id in LENDING_APP_VPAS or _matches_any(combined, LENDING_APP_KEYWORDS):
-            result["txn_type"] = "upi_debit"
-            result["merchant_category"] = "lending_app"
-            return result
+    # ── P2P transfer ──────────────────────────────────────────────────────────
+    is_p2p = (
+        plat == "upi" and
+        not is_likely_lending and not is_likely_utility and
+        not any(k in r_id for k in list(DINING_KEYWORDS) + list(GROCERY_KEYWORDS))
+    )
 
-        # ── Rule 4: ATM withdrawal
-        if plat == "atm" or "atm" in combined:
-            result["txn_type"] = "atm_withdrawal"
-            return result
+    # ── Investment redemption ─────────────────────────────────────────────────
+    is_investment_redeem = any(k in r_id + r_name for k in INVESTMENT_KEYWORDS)
 
-        # ── Rule 5: Utility payment (BBPS or known biller)
-        if plat == "bbps" or _matches_any(combined, UTILITY_BILLER_KEYWORDS):
-            result["txn_type"] = "utility_payment"
-            return result
+    # ── Direction ────────────────────────────────────────────────────────────
+    # Credit: salary, loan disbursement, P2P received, reversal
+    # Debit: all outflows
+    is_credit = is_likely_salary or (
+        plat in ("neft", "imps", "rtgs") and
+        any(k in s_name for k in SALARY_KEYWORDS)
+    )
 
-        # ── Rule 6: Investment / MF / FD
-        if _matches_any(combined, INVESTMENT_KEYWORDS) or cat in ("investment", "mutual_fund"):
-            result["txn_type"] = "neft_rtgs" if is_credit else "upi_debit"
-            result["merchant_category"] = "investment"
-            return result
+    # ── Inferred purpose ─────────────────────────────────────────────────────
+    if is_likely_salary:       purpose = "salary"
+    elif is_likely_emi:        purpose = "emi"
+    elif is_likely_lending:    purpose = "lending_borrow"
+    elif is_likely_utility:    purpose = "utility"
+    elif is_atm:               purpose = "atm_cash"
+    elif is_investment_redeem: purpose = "investment_redeem"
+    else:                      purpose = "other"
 
-        # ── Rule 7: Credit card payment
-        if acct == "credit_card" or cat == "credit_card":
-            result["txn_type"] = "credit_card_payment"
-            return result
+    return {
+        "inferred_purpose":       purpose,
+        "inferred_direction":     "credit" if is_credit else "debit",
+        "is_likely_emi":          is_likely_emi,
+        "is_likely_salary":       is_likely_salary,
+        "is_likely_lending":      is_likely_lending,
+        "is_likely_utility":      is_likely_utility,
+        "is_likely_atm":          is_atm,
+        "is_likely_p2p":          is_p2p,
+        "is_likely_investment":   is_investment_redeem,
+        "payment_failed":         payment_status == "failed",
+    }
 
-        # ── Rule 8: P2P UPI transfer (individual recipient, not merchant)
-        if plat == "upi" and _is_p2p_counterparty(cp_id, cp_name):
-            if is_credit:
-                result["txn_type"] = "upi_credit"
-            else:
-                result["txn_type"] = "upi_debit"
-                result["merchant_category"] = "p2p"
-            return result
 
-        # ── Rule 9: Merchant-category based (dining/grocery/shopping/fuel)
-        if _matches_any(combined, DINING_KEYWORDS) or cat == "dining":
-            result["txn_type"] = "upi_debit" if plat == "upi" else "pos_debit"
-            return result
-
-        if _matches_any(combined, GROCERY_KEYWORDS) or cat in ("groceries", "grocery"):
-            result["txn_type"] = "upi_debit" if plat == "upi" else "pos_debit"
-            return result
-
-        if _matches_any(combined, SHOPPING_KEYWORDS) or cat == "shopping":
-            result["txn_type"] = "upi_debit" if plat == "upi" else "pos_debit"
-            return result
-
-        if _matches_any(combined, FUEL_KEYWORDS) or cat == "fuel":
-            result["txn_type"] = "upi_debit" if plat == "upi" else "pos_debit"
-            return result
-
-        # ── Rule 10: Large savings withdrawal (no matching counterparty)
-        if acct in ("savings", "current") and not is_credit and amount >= 5000:
-            if plat in ("neft", "imps", "rtgs"):
-                result["txn_type"] = "neft_rtgs"
-            else:
-                result["txn_type"] = "savings_withdrawal"
-            return result
-
-        # ── Rule 11: UPI credit (incoming)
-        if is_credit and plat == "upi":
-            result["txn_type"] = "upi_credit"
-            return result
-
-        # ── Rule 12: NEFT/IMPS/RTGS credit
-        if is_credit and plat in ("neft", "imps", "rtgs"):
-            result["txn_type"] = "neft_rtgs"
-            return result
-
-        # ── Default: generic UPI debit or other
-        if plat == "upi":
-            result["txn_type"] = "upi_debit"
-        elif plat == "pos":
-            result["txn_type"] = "pos_debit"
-        else:
-            result["txn_type"] = "other"
-
-        return result
-
+# ── Helper functions ──────────────────────────────────────────────────────────
 
 def _matches_any(text: str, keywords: frozenset) -> bool:
     """Check if any keyword appears in the text."""

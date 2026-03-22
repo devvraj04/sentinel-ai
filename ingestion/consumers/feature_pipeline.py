@@ -62,25 +62,39 @@ class FeaturePipeline:
             conn = psycopg2.connect(settings.database_url, cursor_factory=psycopg2.extras.RealDictCursor)
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT customer_id, amount, txn_type, merchant_category, 
-                           payment_status, account_type, txn_timestamp
-                    FROM transactions 
+                    SELECT customer_id, amount,
+                           sender_id, receiver_id, sender_name, receiver_name,
+                           platform, payment_status,
+                           balance_before, balance_after, balance_change_pct,
+                           txn_timestamp
+                    FROM transactions
                     WHERE txn_timestamp >= NOW() - INTERVAL '30 days'
                     ORDER BY txn_timestamp ASC
                 """)
                 for row in cur.fetchall():
                     cid = row["customer_id"]
-                    # Format correctly as strings/bools as expected by the signal engine
+                    # Enrich with inferred columns using the classifier
+                    from ingestion.enrichment.transaction_classifier import classify as _classify
+                    cls = _classify(
+                        row.get("sender_id"), row.get("receiver_id"),
+                        row.get("sender_name"), row.get("receiver_name"),
+                        str(row.get("platform", "unknown")),
+                        str(row.get("payment_status", "success")),
+                        float(row.get("amount", 0)))
+                    _purpose_map = {
+                        "salary": "salary_credit", "emi": "auto_debit",
+                        "utility": "utility_payment", "atm_cash": "atm_withdrawal",
+                        "lending_borrow": "upi_debit", "other": "upi_debit",
+                    }
                     event = {
                         "customer_id": cid,
                         "amount": float(row["amount"]),
-                        "txn_type": row["txn_type"],
-                        "merchant_category": row["merchant_category"] or "unknown",
-                        "payment_status": row["payment_status"] or "completed",
-                        "account_type": row["account_type"] or "savings",
+                        "txn_type": _purpose_map.get(cls["inferred_purpose"], "upi_debit"),
+                        "merchant_category": ("lending_app" if cls["is_likely_lending"]
+                                              else ("utilities" if cls["is_likely_utility"] else "other")),
+                        "payment_status": row["payment_status"] or "success",
+                        "account_type": "savings",
                         "txn_timestamp": row["txn_timestamp"].isoformat(),
-                        # NOTE: is_lending_app_upi and is_auto_debit_failed REMOVED
-                        # (label leakage). Model infers from merchant_category + txn_type.
                     }
                     self._buffer_event(event)
 

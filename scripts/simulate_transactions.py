@@ -69,9 +69,9 @@ from faker import Faker
 from config.settings import get_settings
 from ingestion.producers.transaction_producer import TransactionProducer
 from ingestion.schemas.transaction_event import (
-    AccountType, MerchantCategory, PaymentStatus,
-    TransactionEvent, TransactionType,
+    PaymentStatus, TransactionEvent,
 )
+from ingestion.enrichment.transaction_classifier import classify as classify_txn
 from serving.bentoml_service.scoring_utils import (
     pd_to_pulse_score, pulse_score_to_tier, get_intervention,
 )
@@ -85,6 +85,48 @@ GEOGRAPHIES = ["Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad",
                "Pune", "Kolkata", "Ahmedabad", "Jaipur", "Surat"]
 SEGMENTS    = ["mass_retail", "mass_retail", "mass_retail", "affluent", "hni"]
 CHANNELS    = ["mobile_app", "net_banking", "branch", "atm"]
+
+# ── Counterparty VPA tables for raw transaction generation ───────────────────
+EMPLOYER_VPAS = {
+    "tcs": ("tcs_payroll@hdfcbank", "TCS Technologies Pvt Ltd"),
+    "infosys": ("infosys_hr@axisbank", "Infosys Limited"),
+    "wipro": ("wipro_salary@icici", "Wipro Limited"),
+    "generic": ("employer_salary@neft", "Employer Payroll"),
+}
+LENDING_APP_VPAS_SIM = [
+    ("slice@upi", "Slice Fintech"), ("lazypay@icici", "LazyPay"),
+    ("kreditbee@upi", "KreditBee"), ("moneyview@upi", "Money View"),
+    ("navi@upi", "Navi Technologies"), ("mpokket@upi", "mPokket"),
+    ("cashe@upi", "CASHe"),
+]
+UTILITY_VPAS_SIM = [
+    ("bescom@bbps", "BESCOM"), ("jio@bbps", "Reliance Jio"),
+    ("airtel@bbps", "Airtel"), ("tata_power@bbps", "Tata Power"),
+]
+EMI_VPAS_SIM = [
+    ("hdfc_loan@ecs", "HDFC Home Loan"), ("sbi_car@nach", "SBI Car Loan"),
+    ("bajaj_personal@nach", "Bajaj Finserv EMI"),
+]
+ATM_LOCATIONS = [
+    ("ATM001@sbi", "SBI ATM"), ("ATM002@hdfc", "HDFC ATM"),
+]
+GROCERY_VPAS_SIM = [
+    ("bigbasket@upi", "BigBasket"), ("blinkit@upi", "Blinkit"),
+    ("dmart@upi", "D-Mart"),
+]
+DINING_VPAS_SIM = [
+    ("swiggy@icici", "Swiggy"), ("zomato@hdfc", "Zomato"),
+]
+SHOPPING_VPAS_SIM = [
+    ("amazon@upi", "Amazon"), ("flipkart@upi", "Flipkart"),
+]
+OCCUPATIONS = {
+    "salaried": ["Software Engineer", "Bank Manager", "Teacher", "Doctor"],
+    "self_employed": ["Shop Owner", "Consultant", "Freelancer"],
+    "gig": ["Delivery Executive", "Cab Driver", "Gig Worker"],
+}
+BANKS = ["SBI", "HDFC Bank", "ICICI Bank", "Axis Bank", "Kotak Mahindra"]
+LOAN_TYPES = ["personal_loan", "home_loan", "car_loan", "education_loan"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,6 +158,7 @@ class CustomerState:
         Not currently used in weights but logged in the summary.
     """
     estimated_balance:    float
+    current_balance:      float = 0.0
     good_streak:          int   = 0
     total_healthy:        int   = 0
     total_stress:         int   = 0
@@ -124,9 +167,8 @@ class CustomerState:
 
 def make_state(customer: dict) -> CustomerState:
     """Initialise state from the customer profile."""
-    return CustomerState(
-        estimated_balance=customer["avg_savings_balance"]
-    )
+    bal = customer["avg_savings_balance"]
+    return CustomerState(estimated_balance=bal, current_balance=bal)
 
 
 # ── Connections ────────────────────────────────────────────────────────────
@@ -199,6 +241,16 @@ def make_customer(idx: int) -> dict[str, Any]:
                                 if emp != "salaried"
                                 else random.uniform(0, 0.2)),
     }
+    # v7 — rich customer profile fields
+    profile["occupation"]    = random.choice(OCCUPATIONS.get(emp, ["Employee"]))
+    profile["employer_name"] = fake.company() if emp == "salaried" else profile["full_name"]
+    profile["bank_name"]     = random.choice(BANKS)
+    profile["loan_type"]     = random.choice(LOAN_TYPES)
+    profile["loan_tenure_months"] = random.choice([12, 24, 36, 48, 60])
+    profile["upi_vpa"]       = (
+        f"{profile['full_name'].lower().replace(' ', '.')[:15]}"
+        f"@{profile['bank_name'].lower().replace(' ', '')[:8]}"
+    )
     profile["risk_level"], profile["stress_base"] = compute_risk(profile)
     return profile
 
@@ -466,8 +518,10 @@ def score_customer(customer: dict, db_conn, dynamo_db,
     try:
         with db_conn.cursor() as cur:
             cur.execute("""
-                SELECT txn_type, amount, merchant_category, payment_status,
-                       account_type, txn_timestamp
+                SELECT sender_id, receiver_id, sender_name, receiver_name,
+                       amount, platform, payment_status,
+                       balance_before, balance_after, balance_change_pct,
+                       txn_timestamp
                 FROM transactions
                 WHERE customer_id = %s
                 ORDER BY txn_timestamp ASC
@@ -478,10 +532,33 @@ def score_customer(customer: dict, db_conn, dynamo_db,
 
     if rows:
         df = pd.DataFrame(rows, columns=[
-            "txn_type", "amount", "merchant_category",
-            "payment_status", "account_type", "txn_timestamp"])
-        # NOTE: is_lending_app_upi and is_auto_debit_failed REMOVED (label leakage)
+            "sender_id", "receiver_id", "sender_name", "receiver_name",
+            "amount", "platform", "payment_status",
+            "balance_before", "balance_after", "balance_change_pct",
+            "txn_timestamp"])
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+        # Enrich with inferred columns so build_feature_vector() works
+        inferred = df.apply(lambda r: classify_txn(
+            r.get("sender_id"), r.get("receiver_id"),
+            r.get("sender_name"), r.get("receiver_name"),
+            str(r.get("platform", "unknown")),
+            str(r.get("payment_status", "success")),
+            float(r.get("amount", 0))), axis=1)
+        inf_df = pd.DataFrame(inferred.tolist())
+        # Map inferred purpose to the column names build_feature_vector expects
+        _purpose_to_txn_type = {
+            "salary": "salary_credit", "emi": "auto_debit",
+            "utility": "utility_payment", "atm_cash": "atm_withdrawal",
+            "lending_borrow": "upi_debit", "other": "upi_debit",
+            "investment_redeem": "neft_rtgs",
+        }
+        df["txn_type"] = inf_df["inferred_purpose"].map(
+            lambda p: _purpose_to_txn_type.get(p, "upi_debit"))
+        df["merchant_category"] = inf_df["inferred_purpose"].map(
+            lambda p: "lending_app" if p == "lending_borrow"
+            else ("utilities" if p == "utility" else "other"))
+        df["account_type"] = inf_df["inferred_direction"].map(
+            lambda d: "savings" if d == "debit" else "savings")
     else:
         df = pd.DataFrame()
 
@@ -610,12 +687,7 @@ def _write_history(result: dict, db_conn) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ensure_customer_postgres(customer: dict, conn) -> None:
-    """
-    Upsert customer profile including all financial fields required
-    by build_feature_vector() — emi_amount, credit_limit, etc.
-    Uses DO UPDATE so re-runs always refresh the values.
-    Requires migration 002 to have been applied first.
-    """
+    """Upsert customer with v7 rich profile columns."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO customers
@@ -623,19 +695,19 @@ def ensure_customer_postgres(customer: dict, conn) -> None:
                  geography, employment_status, monthly_income,
                  emi_amount, credit_limit, avg_savings_balance,
                  tenure_months, expected_salary_day, preferred_channel,
-                 product_mix)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 product_mix,
+                 occupation, employer_name, salary_type, employer_type,
+                 salary_variability, current_savings_balance,
+                 loan_outstanding, loan_original_amount, loan_type,
+                 emi_due_day, loan_tenure_months,
+                 upi_vpa, city, bank_name,
+                 has_active_loan, has_credit_card, risk_segment)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (customer_id) DO UPDATE SET
-                full_name           = EXCLUDED.full_name,
-                monthly_income      = EXCLUDED.monthly_income,
-                emi_amount          = EXCLUDED.emi_amount,
-                credit_limit        = EXCLUDED.credit_limit,
-                avg_savings_balance = EXCLUDED.avg_savings_balance,
-                tenure_months       = EXCLUDED.tenure_months,
-                expected_salary_day = EXCLUDED.expected_salary_day,
-                preferred_channel   = EXCLUDED.preferred_channel,
-                product_mix         = EXCLUDED.product_mix,
-                updated_at          = NOW()
+                current_savings_balance = EXCLUDED.current_savings_balance,
+                monthly_income          = EXCLUDED.monthly_income,
+                updated_at              = NOW()
         """, (
             customer["customer_id"],
             customer["full_name"],
@@ -652,27 +724,53 @@ def ensure_customer_postgres(customer: dict, conn) -> None:
             int(customer.get("salary_day", 3)),
             customer.get("preferred_channel", "UPI"),
             customer.get("product_mix", "both"),
+            customer.get("occupation", "Unknown"),
+            customer.get("employer_name", ""),
+            customer["employment_status"],
+            "private" if customer["employment_status"] == "salaried" else "self",
+            float(customer.get("salary_irregularity", 0.1)),
+            float(customer["avg_savings_balance"]),
+            float(customer["emi_amount"] * customer.get("loan_tenure_months", 24)),
+            float(customer["emi_amount"] * 36),
+            customer.get("loan_type", "personal_loan"),
+            int(customer.get("emi_due_day", 5)),
+            customer.get("loan_tenure_months", 36),
+            customer.get("upi_vpa", ""),
+            customer["geography"],
+            customer.get("bank_name", "SBI"),
+            customer["emi_amount"] > 0,
+            customer["credit_limit"] > 0,
+            customer.get("risk_level", "standard"),
         ))
     conn.commit()
 
 
 def insert_transaction(evt: TransactionEvent, conn) -> None:
+    """Write transaction with raw fact columns to PostgreSQL."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO transactions
-                (customer_id, account_id, txn_type, amount,
-                 merchant_category, payment_channel, payment_status,
-                 txn_timestamp)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                (customer_id, account_id,
+                 sender_id, sender_name, receiver_id, receiver_name,
+                 amount, platform, payment_status,
+                 balance_before, balance_after, balance_change_pct,
+                 reference_number, txn_timestamp)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT DO NOTHING
         """, (
             evt.customer_id,
-            getattr(evt, "account_id", None),
-            evt.txn_type.value      if hasattr(evt.txn_type, "value")           else str(evt.txn_type),
+            evt.account_id,
+            evt.sender_id,
+            evt.sender_name,
+            evt.receiver_id,
+            evt.receiver_name,
             float(evt.amount),
-            evt.merchant_category.value if hasattr(evt.merchant_category, "value") else str(evt.merchant_category),
-            evt.payment_channel,
-            evt.payment_status.value if hasattr(evt.payment_status, "value")    else str(evt.payment_status),
+            evt.platform,
+            evt.payment_status,
+            evt.balance_before,
+            evt.balance_after,
+            evt.balance_change_pct,
+            evt.reference_number,
             evt.txn_timestamp,
         ))
     conn.commit()
@@ -775,24 +873,54 @@ def _build_weights(stress: float,
 # TRANSACTION GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _make_evt(customer: dict, state: CustomerState, amount: float,
+              sender_id: str, sender_name: str,
+              receiver_id: str, receiver_name: str,
+              platform: str, payment_status: str,
+              now: datetime, is_credit: bool = False) -> TransactionEvent:
+    """Build a raw-facts TransactionEvent with balance tracking."""
+    bal_before = state.current_balance
+    if payment_status == "failed":
+        bal_after = bal_before  # no money moves on failed txn
+    elif is_credit:
+        bal_after = bal_before + amount
+    else:
+        bal_after = max(0.0, bal_before - amount)
+    state.current_balance = bal_after
+    return TransactionEvent(
+        customer_id=customer["customer_id"],
+        sender_id=sender_id,
+        sender_name=sender_name,
+        receiver_id=receiver_id,
+        receiver_name=receiver_name,
+        amount=round(amount, 2),
+        platform=platform,
+        payment_status=payment_status,
+        balance_before=round(bal_before, 2),
+        balance_after=round(bal_after, 2),
+        txn_timestamp=now,
+    )
+
+
 def next_transaction(customer: dict, now: datetime,
-                     good_streak: int = 0) -> tuple[TransactionEvent, str]:
+                     good_streak: int = 0,
+                     state: Optional[CustomerState] = None) -> tuple[TransactionEvent, str]:
     """
-    Generate exactly one transaction for *customer* at timestamp *now*.
+    Generate exactly one raw-fact transaction for *customer* at timestamp *now*.
     Returns (TransactionEvent, kind) so the caller can update the streak.
-
-    Stress fraction WITH streak=0:
-      stress_base = 0.0 (healthy)  → ~0%  stress events
-      stress_base = 0.5 (at-risk)  → ~12% stress events
-      stress_base = 1.0 (high-risk)→ ~25% stress events
-
-    With streak=35+ those fractions are further halved by the healthy multiplier.
     """
     cid    = customer["customer_id"]
+    vpa    = customer.get("upi_vpa", cid)
+    name   = customer["full_name"]
     income = customer["monthly_income"]
     emi    = customer["emi_amount"]
     stress = customer["stress_base"]
     credit = customer["credit_limit"]
+
+    # Use a dummy state if none provided (backwards compat)
+    if state is None:
+        state = CustomerState(estimated_balance=customer["avg_savings_balance"],
+                              current_balance=customer["avg_savings_balance"])
 
     kinds, weights = _build_weights(stress, good_streak=good_streak)
     kind = random.choices(kinds, weights=weights, k=1)[0]
@@ -800,187 +928,135 @@ def next_transaction(customer: dict, now: datetime,
     # ── HEALTHY ──────────────────────────────────────────────────────────
 
     if kind == "salary_credit":
-        # On-time for healthy customers; mild delay possible for stressed.
-        # → income_coverage_ratio↑, salary_delay_days↓ → PD↓ → score↓
         delay_days = (0 if stress < 0.3
                       else random.randint(0, max(1, int(4 * stress))))
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.SALARY_CREDIT,
+        emp_key = random.choice(list(EMPLOYER_VPAS.keys()))
+        emp_vpa, emp_name = EMPLOYER_VPAS[emp_key]
+        return _make_evt(customer, state,
             amount=round(income * random.uniform(0.92, 1.02)),
-            merchant_category=MerchantCategory.OTHER,
-            payment_channel="NEFT",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now - timedelta(days=delay_days),
+            sender_id=emp_vpa, sender_name=emp_name,
+            receiver_id=vpa,   receiver_name=name,
+            platform="NEFT", payment_status="success",
+            now=now - timedelta(days=delay_days), is_credit=True,
         ), kind
 
     elif kind == "utility_ok":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.UTILITY_PAYMENT,
+        u_vpa, u_name = random.choice(UTILITY_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(random.uniform(300, 4000), 2),
-            merchant_category=MerchantCategory.UTILITIES,
-            payment_channel="UPI",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=u_vpa, receiver_name=u_name,
+            platform="BBPS", payment_status="success", now=now,
         ), kind
 
     elif kind == "auto_debit_ok":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.LOAN,
-            txn_type=TransactionType.AUTO_DEBIT,
+        e_vpa, e_name = random.choice(EMI_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(emi),
-            payment_channel="ECS",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=e_vpa, receiver_name=e_name,
+            platform="ECS", payment_status="success", now=now,
         ), kind
 
     elif kind == "upi_groceries":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.UPI_DEBIT,
+        g_vpa, g_name = random.choice(GROCERY_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(random.uniform(200, min(income * 0.05, 3000)), 2),
-            merchant_category=MerchantCategory.GROCERIES,
-            payment_channel="UPI",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=g_vpa, receiver_name=g_name,
+            platform="UPI", payment_status="success", now=now,
         ), kind
 
     elif kind == "credit_card_bill_pay":
-        # CRITICAL: bill payment → SAVINGS + TRANSFER_OUT → cc_s NOT touched
-        # → credit_utilization_delta NOT raised → score ↓
-        bill = round(random.uniform(
-            credit * 0.03,
-            min(credit * 0.20, income * 0.25),
-        ), 2)
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.TRANSFER_OUT,
+        bill = round(random.uniform(credit * 0.03, min(credit * 0.20, income * 0.25)), 2)
+        return _make_evt(customer, state,
             amount=bill,
-            merchant_category=MerchantCategory.OTHER,
-            payment_channel="NEFT",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id="cc_billpay@neft", receiver_name="Credit Card Bill Payment",
+            platform="NEFT", payment_status="success", now=now,
         ), kind
 
     elif kind == "atm_small":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.ATM_WITHDRAWAL,
+        a_vpa, a_name = random.choice(ATM_LOCATIONS)
+        return _make_evt(customer, state,
             amount=random.choice([500, 1000, 2000]),
-            merchant_category=MerchantCategory.OTHER,
-            payment_channel="ATM",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=a_vpa, receiver_name=a_name,
+            platform="ATM", payment_status="success", now=now,
         ), kind
 
     elif kind == "upi_dining":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.UPI_DEBIT,
+        d_vpa, d_name = random.choice(DINING_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(random.uniform(80, min(income * 0.03, 1500)), 2),
-            merchant_category=MerchantCategory.DINING,
-            payment_channel="UPI",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=d_vpa, receiver_name=d_name,
+            platform="UPI", payment_status="success", now=now,
         ), kind
 
     elif kind == "upi_shopping":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.UPI_DEBIT,
+        s_vpa, s_name = random.choice(SHOPPING_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(random.uniform(300, min(income * 0.06, 5000)), 2),
-            merchant_category=MerchantCategory.SHOPPING,
-            payment_channel="UPI",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=s_vpa, receiver_name=s_name,
+            platform="UPI", payment_status="success", now=now,
         ), kind
 
     elif kind == "credit_card_spend":
-        # Spending ON the card → cc_s↑ → utilization↑ → score↑ slightly
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.CREDIT_CARD,
-            txn_type=TransactionType.CREDIT_CARD_PAYMENT,
+        merchant = random.choice(GROCERY_VPAS_SIM + DINING_VPAS_SIM + SHOPPING_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(random.uniform(300, min(credit * 0.08, income * 0.10)), 2),
-            merchant_category=random.choice([
-                MerchantCategory.GROCERIES,
-                MerchantCategory.DINING,
-                MerchantCategory.SHOPPING,
-            ]),
-            payment_channel="POS",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=merchant[0], receiver_name=merchant[1],
+            platform="POS", payment_status="success", now=now,
         ), kind
 
     # ── STRESS ───────────────────────────────────────────────────────────
 
     elif kind == "savings_drain":
         drain_pct = random.uniform(0.03, max(0.04, 0.12 * stress))
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.SAVINGS_WITHDRAWAL,
+        return _make_evt(customer, state,
             amount=round(max(500, customer["avg_savings_balance"] * drain_pct), 2),
-            merchant_category=MerchantCategory.OTHER,
-            payment_channel="NEFT",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id="savings_transfer@neft", receiver_name="Savings Transfer",
+            platform="NEFT", payment_status="success", now=now,
         ), kind
 
     elif kind == "atm_large":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.ATM_WITHDRAWAL,
+        a_vpa, a_name = random.choice(ATM_LOCATIONS)
+        return _make_evt(customer, state,
             amount=random.choice([5000, 10000]),
-            merchant_category=MerchantCategory.OTHER,
-            payment_channel="ATM",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=a_vpa, receiver_name=a_name,
+            platform="ATM", payment_status="success", now=now,
         ), kind
 
     elif kind == "utility_fail":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.UTILITY_PAYMENT,
+        u_vpa, u_name = random.choice(UTILITY_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(random.uniform(300, 3000), 2),
-            merchant_category=MerchantCategory.UTILITIES,
-            payment_channel="UPI",
-            payment_status=PaymentStatus.FAILED,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=u_vpa, receiver_name=u_name,
+            platform="BBPS", payment_status="failed", now=now,
         ), kind
 
     elif kind == "auto_debit_fail":
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.LOAN,
-            txn_type=TransactionType.AUTO_DEBIT,
+        e_vpa, e_name = random.choice(EMI_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(emi),
-            payment_channel="ECS",
-            payment_status=PaymentStatus.FAILED,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=e_vpa, receiver_name=e_name,
+            platform="ECS", payment_status="failed", now=now,
         ), kind
 
     else:  # lending_app
-        return TransactionEvent(
-            customer_id=cid,
-            account_type=AccountType.SAVINGS,
-            txn_type=TransactionType.UPI_DEBIT,
+        l_vpa, l_name = random.choice(LENDING_APP_VPAS_SIM)
+        return _make_evt(customer, state,
             amount=round(random.uniform(2000, min(15000, income * 0.4)), 2),
-            merchant_category=MerchantCategory.LENDING_APP,
-            payment_channel="UPI",
-            payment_status=PaymentStatus.SUCCESS,
-            txn_timestamp=now,
+            sender_id=vpa, sender_name=name,
+            receiver_id=l_vpa, receiver_name=l_name,
+            platform="UPI", payment_status="success", now=now,
         ), kind
 
 
@@ -989,34 +1065,76 @@ def next_transaction(customer: dict, now: datetime,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_stress(evt: TransactionEvent) -> tuple[bool, str]:
-    tt  = evt.txn_type.value      if hasattr(evt.txn_type, "value")           else str(evt.txn_type)
-    st  = evt.payment_status.value if hasattr(evt.payment_status, "value")    else str(evt.payment_status)
-    cat = evt.merchant_category.value if hasattr(evt.merchant_category, "value") else str(evt.merchant_category)
-    amt = float(evt.amount)
+    """Detect stress signals from raw facts (console display only)."""
+    r_id = (evt.receiver_id or "").lower()
+    st   = str(evt.payment_status).lower()
+    plat = (evt.platform or "").lower()
+    amt  = float(evt.amount)
 
-    if tt == "auto_debit" and st == "failed":
+    # Failed EMI (ECS/NACH platform + failed)
+    if plat in ("ecs", "nach") and st == "failed":
         return True, "FAILED EMI"
-    if cat == "lending_app":
+    # Lending app (receiver VPA matches known lending apps)
+    from ingestion.enrichment.transaction_classifier import LENDING_APP_VPAS
+    if any(k in r_id for k in LENDING_APP_VPAS):
         return True, "LENDING APP"
-    if tt == "utility_payment" and st == "failed":
+    # Failed utility
+    if plat == "bbps" and st == "failed":
         return True, "FAILED UTILITY"
-    if tt == "atm_withdrawal" and amt >= 5000:
+    # Large ATM
+    if plat == "atm" and amt >= 5000:
         return True, "LARGE ATM"
-    if tt == "savings_withdrawal" and amt >= 8000:
+    # Savings drain (large NEFT transfer out)
+    if plat == "neft" and amt >= 8000 and "savings_transfer" in r_id:
         return True, "SAVINGS DRAIN"
     return False, ""
 
 
 def _txn_label(evt: TransactionEvent) -> str:
-    """Human-readable label — distinguishes CC spend from CC bill payment."""
-    if (evt.txn_type == TransactionType.TRANSFER_OUT and
-            evt.account_type == AccountType.SAVINGS):
+    """Human-readable label from raw facts."""
+    r_id = (evt.receiver_id or "").lower()
+    plat = (evt.platform or "").upper()
+    r_name = (evt.receiver_name or "")
+
+    if "cc_billpay" in r_id:
         return "CC BILL PAYMENT"
-    if (evt.txn_type == TransactionType.CREDIT_CARD_PAYMENT and
-            evt.account_type == AccountType.CREDIT_CARD):
+    if plat == "POS":
         return "CC SPEND"
-    return (evt.txn_type.value if hasattr(evt.txn_type, "value")
-            else str(evt.txn_type)).replace("_", " ").upper()[:16]
+    if plat == "ATM":
+        return "ATM WITHDRAWAL"
+    if plat in ("ECS", "NACH"):
+        return "EMI AUTO-DEBIT"
+    if plat == "BBPS":
+        return "UTILITY PAYMENT"
+    if r_name:
+        return r_name[:16].upper()
+    return plat[:16]
+
+
+def _update_balance(state: CustomerState,
+                    evt: TransactionEvent) -> None:
+    """
+    Update estimated_balance from the evt's balance_after.
+    With v7 raw facts, the balance is tracked in _make_evt(),
+    so we just sync the estimated_balance with current_balance.
+    """
+    if evt.balance_after is not None:
+        state.estimated_balance = evt.balance_after
+    else:
+        # Fallback for events without balance tracking
+        st = str(evt.payment_status).lower()
+        if st == "failed":
+            return
+        amt = float(evt.amount)
+        # Simple heuristic: credits increase, debits decrease
+        from ingestion.enrichment.transaction_classifier import classify as _classify
+        cls = _classify(evt.sender_id, evt.receiver_id, evt.sender_name,
+                        evt.receiver_name, evt.platform or "unknown",
+                        str(evt.payment_status), amt)
+        if cls["inferred_direction"] == "credit":
+            state.estimated_balance += amt
+        else:
+            state.estimated_balance = max(0.0, state.estimated_balance - amt)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1024,54 +1142,13 @@ def _txn_label(evt: TransactionEvent) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _update_state(state: CustomerState, kind: str) -> None:
-    """
-    Update good_streak and counters after each transaction.
-
-    Healthy kinds → streak increments.
-    Stress kinds  → streak resets to 0 (any single bad event breaks the run).
-    """
+    """Update good_streak and counters after each transaction."""
     if kind in _HEALTHY_KINDS:
         state.good_streak   += 1
         state.total_healthy += 1
     elif kind in _STRESS_KINDS:
-        state.good_streak  = 0      # reset — sustained good behavior interrupted
+        state.good_streak  = 0
         state.total_stress += 1
-
-
-def _update_balance(state: CustomerState,
-                    evt: TransactionEvent) -> None:
-    """
-    Update estimated_balance based on the transaction.
-
-    Rules:
-      - FAILED transactions move no money.
-      - Salary credits / UPI credits / reversals → INFLOWS → balance ↑
-      - All SAVINGS account debits (spend, bill pay, ATM, EMI, etc.) → balance ↓
-      - CREDIT_CARD account transactions don't touch the savings balance directly
-        (the bill payment is already handled as SAVINGS TRANSFER_OUT).
-      - Balance is floored at 0 — we don't model overdraft.
-    """
-    st  = (evt.payment_status.value if hasattr(evt.payment_status, "value")
-           else str(evt.payment_status))
-    tt  = (evt.txn_type.value if hasattr(evt.txn_type, "value")
-           else str(evt.txn_type))
-    amt = float(evt.amount)
-
-    if st == "failed":
-        return   # no money moves on failed transactions
-
-    # Inflows to savings
-    if tt in ("salary_credit", "upi_credit", "neft_rtgs", "reversal"):
-        state.estimated_balance += amt
-
-    # Outflows from savings account
-    elif (hasattr(evt.account_type, "value") and
-          evt.account_type.value == "savings") or str(evt.account_type) == "savings":
-        state.estimated_balance = max(0.0, state.estimated_balance - amt)
-
-    # LOAN / CREDIT_CARD account transactions don't affect estimated savings balance
-
-
 
 
 def _print_summary(customers: list, current_scores: dict,
@@ -1200,7 +1277,8 @@ def run_pipeline(
 
                 # ② Generate transaction — pass good_streak so weights are adjusted
                 evt, kind = next_transaction(customer, txn_ts,
-                                             good_streak=state.good_streak)
+                                             good_streak=state.good_streak,
+                                             state=state)
 
                 # ③ Publish to Kafka, persist to PostgreSQL
                 producer.publish(evt)
@@ -1263,19 +1341,24 @@ def run_pipeline(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
-        description="Sentinel — Infinite Random Transaction Simulator"
+        description="Sentinel — Transaction Simulator (seed / realtime)"
     )
     parser.add_argument("--customers", type=int,   default=100,
                         help="Number of customers (default 100)")
     parser.add_argument("--delay",     type=float, default=0,
                         help="Delay between transactions in ms (default 0)")
+    parser.add_argument("--mode",      type=str,   default="realtime",
+                        choices=["seed", "realtime"],
+                        help="seed = generate historical data then exit; "
+                             "realtime = continuous scoring loop (default realtime)")
     args = parser.parse_args()
 
     print("=" * 76)
-    print("SENTINEL — Infinite Random Transaction Simulator")
+    print("SENTINEL — Transaction Simulator")
     print(f"  Customers : {args.customers}")
     print(f"  Delay     : {args.delay} ms")
-    print(f"  Mode      : uniform random user | score every txn | Ctrl+C to stop")
+    print(f"  Mode      : {args.mode}")
+    print(f"  Stop      : Ctrl+C")
     print("=" * 76 + "\n")
 
     print("Connecting to PostgreSQL...", end="", flush=True)

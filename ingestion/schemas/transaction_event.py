@@ -1,126 +1,129 @@
 """
 ingestion/schemas/transaction_event.py
 ──────────────────────────────────────────────────────────────────────────────
-Defines the canonical shape of every transaction event that flows through
-the system. Every producer MUST create TransactionEvent objects.
-Every consumer receives TransactionEvent objects.
-This is the contract between ingestion and all downstream systems.
+Defines the canonical shape of every transaction event flowing through Sentinel.
+
+DESIGN PRINCIPLE — RAW FACTS ONLY:
+  The TransactionEvent carries only factual, observable data about the
+  transaction. It does NOT carry any interpretive labels. The pipeline
+  infers meaning from the raw facts.
+
+  REMOVED (were label leakage):
+    - txn_type (e.g. SALARY_CREDIT, AUTO_DEBIT) ← pre-classified label
+    - merchant_category (e.g. LENDING_APP) ← pre-classified label
+    - is_lending_app_upi ← explicit stress flag
+    - is_auto_debit_failed ← explicit stress flag
+
+  ADDED (raw facts):
+    - sender_id: UPI VPA of the sender (e.g. rahul.sharma@sbi)
+    - receiver_id: UPI VPA or account ref of the receiver (e.g. slice@upi)
+    - sender_name: human-readable sender name
+    - receiver_name: human-readable receiver name (e.g. "Slice Fintech Pvt Ltd")
+    - balance_before: savings balance before this transaction
+    - balance_after: savings balance after this transaction
+    - balance_change_pct: (after - before) / abs(before)
+    - platform: UPI / NEFT / IMPS / ATM / ECS / POS etc.
+    - payment_status: success / failed / pending / reversed
+
+  The transaction_classifier.py uses receiver_id patterns (e.g. slice@upi,
+  lazypay@upi, bescom@bbps) to infer transaction purpose for FEATURE
+  COMPUTATION ONLY — never to set a flag or label on the event itself.
+
+Indian Banking Context:
+  - UPI VPA format: name@bankcode (e.g. rahul.sharma@sbi, swiggy@yesbank)
+  - NACH/ECS: used for recurring EMI auto-debits
+  - BBPS: used for utility bill payments (electricity, gas, water)
+  - IMPS/NEFT/RTGS: used for salary credits and large transfers
+  - ATM: cash withdrawals — counterparty is the ATM location code
 ──────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
- 
+
 import uuid
 from datetime import datetime, timezone
-from enum import Enum
 from typing import Optional
- 
-from pydantic import BaseModel, Field, field_validator
- 
- 
-class TransactionType(str, Enum):
-    SALARY_CREDIT    = "salary_credit"
-    UPI_DEBIT        = "upi_debit"
-    UPI_CREDIT       = "upi_credit"
-    ATM_WITHDRAWAL   = "atm_withdrawal"
-    AUTO_DEBIT       = "auto_debit"          # EMI / recurring payment
-    UTILITY_PAYMENT  = "utility_payment"
-    CREDIT_CARD_PAYMENT = "credit_card_payment"
-    NEFT_RTGS        = "neft_rtgs"
-    POS_DEBIT        = "pos_debit"
-    SAVINGS_WITHDRAWAL = "savings_withdrawal"
-    LOAN_DISBURSEMENT  = "loan_disbursement"
-    INTEREST_DEBIT     = "interest_debit"
-    REVERSAL           = "reversal"
-    OTHER              = "other"
-    TRANSFER_OUT = "transfer_out"
- 
- 
-class PaymentStatus(str, Enum):
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class PaymentStatus(str):
     SUCCESS  = "success"
     FAILED   = "failed"
     PENDING  = "pending"
     REVERSED = "reversed"
- 
- 
-class MerchantCategory(str, Enum):
-    DINING        = "dining"
-    ENTERTAINMENT = "entertainment"
-    GROCERIES     = "groceries"
-    UTILITIES     = "utilities"
-    FUEL          = "fuel"
-    HEALTHCARE    = "healthcare"
-    EDUCATION     = "education"
-    LENDING_APP   = "lending_app"    # UPI to lending apps — key stress signal
-    GAMBLING      = "gambling"
-    LOTTERY       = "lottery"
-    TRAVEL        = "travel"
-    SHOPPING      = "shopping"
-    GROCERY       = "grocery" 
-    OTHER         = "other"
- 
- 
-class AccountType(str, Enum):
-    LOAN        = "loan"
-    CREDIT_CARD = "credit_card"
-    SAVINGS     = "savings"
-    CURRENT     = "current"
- 
- 
+
+
 class TransactionEvent(BaseModel):
-    """Single transaction event — the atomic unit of the entire system."""
- 
-    # Identity
+    """
+    Single raw transaction event — atomic unit of the entire system.
+
+    This is a FACT RECORD, not a labelled event. It contains exactly what
+    the bank ledger contains: who sent, who received, how much, what platform,
+    did it succeed, and what were the account balances before and after.
+
+    The model infers EVERYTHING ELSE from these raw facts.
+    """
+
+    # ── Identity ──────────────────────────────────────────────────────────────
     event_id:       str = Field(default_factory=lambda: str(uuid.uuid4()))
     customer_id:    str = Field(..., min_length=1, max_length=50)
     account_id:     Optional[str] = None
-    account_type:   AccountType
- 
-    # Transaction details
-    txn_type:           TransactionType = TransactionType.OTHER  # Auto-classified by enrichment
-    amount:             float = Field(..., gt=0)
-    merchant_category:  MerchantCategory = MerchantCategory.OTHER
-    payment_channel:    str = "unknown"  # Legacy — prefer `platform`
-    payment_status:     PaymentStatus = PaymentStatus.SUCCESS
 
-    # Indian banking context — counterparty & platform
-    counterparty_id:    Optional[str] = None   # UPI VPA (e.g., swiggy@upi) or bank account
-    counterparty_name:  Optional[str] = None   # Human-readable name (e.g., Swiggy, BESCOM)
-    reference_number:   Optional[str] = None   # UTR/RRN/IMPS reference
-    platform:           str = "unknown"        # UPI/NEFT/IMPS/RTGS/NACH/BBPS/POS/ATM/NetBanking
+    # ── Counterparty (raw VPA or account reference) ───────────────────────────
+    # For a DEBIT: sender = customer, receiver = payee
+    # For a CREDIT: sender = payer, receiver = customer
+    sender_id:      Optional[str] = None   # UPI VPA or bank account ref
+    sender_name:    Optional[str] = None   # e.g. "Rahul Sharma" or "TCS Payroll"
+    receiver_id:    Optional[str] = None   # e.g. "slice@upi", "bescom@bbps"
+    receiver_name:  Optional[str] = None   # e.g. "Slice Fintech", "BESCOM"
 
-    # Balance tracking (never negative for savings/current accounts)
-    balance_before:     Optional[float] = None  # Account balance before this transaction
-    balance_after:      Optional[float] = None  # Account balance after this transaction
- 
-    # Timing
-    txn_timestamp:  datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
- 
-    # NOTE: Pre-labelling fields (is_lending_app_upi, is_auto_debit_failed,
-    # is_p2p_transfer, is_investment_txn) have been REMOVED to eliminate
-    # label leakage. The model now infers stress from raw transaction facts:
-    # merchant_category, txn_type, payment_status, counterparty patterns.
- 
-    # Kafka metadata (filled by consumer, not producer)
-    kafka_partition:    Optional[int] = None
-    kafka_offset:       Optional[int] = None
-    ingested_at:        Optional[datetime] = None
- 
+    # ── Transaction facts ─────────────────────────────────────────────────────
+    amount:         float = Field(..., gt=0)
+    platform:       str = "unknown"        # UPI / NEFT / IMPS / ATM / ECS / BBPS / POS
+    payment_status: str = "success"        # success / failed / pending / reversed
+    reference_number: Optional[str] = None # UTR (NEFT/RTGS) or RRN (UPI)
+
+    # ── Balance tracking ─────────────────────────────────────────────────────
+    # balance_before and balance_after are the customer's PRIMARY savings balance
+    # BEFORE and AFTER this transaction is applied.
+    # balance_change_pct = (balance_after - balance_before) / abs(balance_before)
+    # Negative = balance dropped. Never stored as positive when balance falls.
+    balance_before:     Optional[float] = None
+    balance_after:      Optional[float] = None
+    balance_change_pct: Optional[float] = None  # computed by simulator, stored as fact
+
+    # ── Timing ────────────────────────────────────────────────────────────────
+    txn_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # ── Kafka metadata (filled by consumer) ──────────────────────────────────
+    kafka_partition: Optional[int] = None
+    kafka_offset:    Optional[int] = None
+    ingested_at:     Optional[datetime] = None
+
     @field_validator("amount")
     @classmethod
     def round_amount(cls, v: float) -> float:
         return round(v, 2)
- 
+
+    @model_validator(mode="after")
+    def compute_balance_change(self) -> "TransactionEvent":
+        """Auto-compute balance_change_pct if balances are provided but pct is not."""
+        if (self.balance_change_pct is None and
+                self.balance_before is not None and
+                self.balance_after is not None and
+                abs(self.balance_before) > 0):
+            self.balance_change_pct = round(
+                (self.balance_after - self.balance_before) / abs(self.balance_before), 4
+            )
+        return self
+
     def to_dict(self) -> dict:
-        """Serialize to dict for Kafka message value."""
         data = self.model_dump()
-        # Convert datetime to ISO string for JSON serialization
         data["txn_timestamp"] = self.txn_timestamp.isoformat()
         if self.ingested_at:
             data["ingested_at"] = self.ingested_at.isoformat()
         return data
- 
+
     @classmethod
     def from_dict(cls, data: dict) -> "TransactionEvent":
-        """Deserialize from Kafka message."""
         return cls(**data)
-
